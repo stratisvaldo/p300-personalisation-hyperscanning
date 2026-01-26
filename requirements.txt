@@ -1,0 +1,13 @@
+numpy<2
+
+scipy
+pandas
+scikit-learn
+
+mne
+moabb<1.4
+pyriemann<0.9
+braindecode
+
+optuna
+statsmodels
