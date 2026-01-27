@@ -1,7 +1,8 @@
 numpy<2
 
 scipy
-pandas
+pandas==2.3.3
+wfdb==4.3.0
 scikit-learn
 
 mne
@@ -11,3 +12,5 @@ braindecode
 
 optuna
 statsmodels
+
+ipykernel
