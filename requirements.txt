@@ -13,4 +13,6 @@ braindecode
 optuna
 statsmodels
 
+openpyxl
+
 ipykernel
