@@ -35,11 +35,11 @@ python train_eegnet_calibration.py \
   --out_path models_eegnet/eegnet_calib_only.pkl
 
 Train and initialise from saved weights:
-python train_eegnet_calibration.py \
-  --epochs_path data/p300_epochs_play_01.npz \
-  --out_path models_eegnet/eegnet_calib_finetuned.pkl \
-  --use_init_weights \
-  --init_weights_path models_eegnet/eegnet_small_hpo_23epochs_seed2025.pkl
+python Experiment_set_up/Decoder/train_EEGnet.py `
+  --epochs_path Experiment_set_up/Receiver_script/data/p300_epochs_play_01.npz `
+  --out_path Notebook/models_eegnet/eegnet_calib_finetuned.pkl `
+  --use_init_weights `
+  --init_weights_path Notebook/models_eegnet/eegnet_small_hpo_23epochs_seed2025.pkl
 
 
 '''

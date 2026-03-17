@@ -1,13 +1,14 @@
-# Load saved calibration recording 
-# Find every flash_on marker 
-# Extract an EEG epoch around that marker 
+# Load saved calibration recording
+# Find every flash_on marker
+# Extract an EEG epoch around that marker
 # Label each epoch as target or non-target
 # Save a new .npz with X,y metadata
 
 # script saved X as (N_epochs, Timepoints, Channels)
 
 '''
-python extract_p300_epochs.py --input data/calib_play_01.npz --output data/p300_epochs_play_01.npz --tmin 0.0 --tmax 0.8
+From Experiment_set_up
+python Epoch_extraction/epoch_extraction_calibration.py --input Receiver_script/data/calib_play_01.npz --output Receiver_script/data/p300_epochs_play_01.npz --tmin 0.0 --tmax 0.8
 '''
 
 import os
@@ -60,7 +61,8 @@ def main():
 
     data = load_recording(args.input)
 
-    eeg_samples = data["eeg_samples"]
+    # Keep only the 8 EEG electrodes from the Unicorn stream
+    eeg_samples = data["eeg_samples"][:, :8]
     eeg_timestamps = data["eeg_timestamps"]
     eeg_srate = float(data["eeg_srate"][0])
 

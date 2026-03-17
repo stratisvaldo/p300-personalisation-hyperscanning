@@ -8,7 +8,7 @@
 How to run it:
 1) start unicorn EEG streaming (LSL Unicorn)
 2) Start PsychoPy experiment with LSL markers
-3) Start the receiver -python3 Receiver_script/receiver_calibration.py --eeg_name Unicorn --marker_name P300Markers --output data/calib_play_01.npz --print_markers
+3) Start the receiver -python Receiver_script/receiver_calibration.py --eeg_name Unicorn --marker_name P300Markers --output data/calib_play_01.npz --print_markers
 - eeg_timestamps: one LSL timestamp per EEG sample
 - markers_raw: raw marker strings 
 - marker_timestamps: one LSL timestamp per marker
