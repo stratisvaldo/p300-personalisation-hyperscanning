@@ -1,8 +1,7 @@
 '''
 - Connect to Unicorn EEG
 - Connect to marker stream from free-speller
-- Load pre-trained EEGNet model
-- Load saved channel-wise normalisation statistics
+- Load trained SVM model
 - Compute target probability for flashes row or column
 - Accumulate evidence across sequences
 - Predict the row and column and convert to symbol
@@ -10,23 +9,23 @@
 - Optionally save online decisions for later analysis
 - Save per-flash outputs as well
 
-Online pre-processing matches CNN calibration epoching except:
+Online preprocessing matches traditional ML training preprocessing except:
 - no artifact thresholding online
+- no resampling online
 
 Pipeline per flash:
 1. filter continuous EEG from 0.1 to 20 Hz
 2. epoch from tmin to tmax around flash_on marker
 3. baseline correction
-4. convert from (T, C) to (1, C, T)
-5. apply saved channel-wise normalisation stats
-6. score with EEGNet
+4. downsample by factor 4
+5. flatten to (1, Features)
+6. apply saved scaler + SVM through sklearn pipeline
 
 Running:
-python online_EEGNet.py `
-  --eeg_name UnicornRecorderLSLStream `
+python online_free_spell_decoder_svm.py `
+  --eeg_name Unicorn `
   --marker_name P300Markers `
-  --model_path models_eegnet/eegnet_calib_finetuned.pkl `
-  --norm_path models_eegnet/eegnet_calib_finetuned_norm.npz `
+  --model_path models_svm/svm_calibration.joblib `
   --tmin 0.0 `
   --tmax 0.8 `
   --baseline 0.0 `
@@ -34,19 +33,18 @@ python online_EEGNet.py `
   --highcut 20.0 `
   --filter_order 4 `
   --expected_srate 250 `
-  --save_decisions data/testing_play_01_decisions.npz
+  --downsample_factor 4 `
+  --save_decisions data/testing_play_01_svm_decisions.npz
 '''
 
 import os
 import time
 import argparse
+import joblib
 import numpy as np
-import torch
 
 from scipy.signal import butter, filtfilt
 from pylsl import resolve_byprop, StreamInlet, StreamInfo, StreamOutlet, local_clock
-from braindecode import EEGClassifier
-from braindecode.models import EEGNet
 
 
 # Grid definition
@@ -69,21 +67,6 @@ GRID_SYMBOLS = [
 # -------------------------------------------------------------
 
 def parse_marker(marker: str):
-    """
-    Testing marker formats expected here:
-
-    experiment_start
-    experiment_end
-
-    selection_start/0
-    selection_end/0
-
-    sequence_start/0/0
-    sequence_end/0/0
-
-    flash_on/row/2/sel_0/seq_0/flash_3
-    flash_off/col/4/sel_0/seq_0/flash_8
-    """
     parts = marker.strip().split("/")
 
     out = {
@@ -153,31 +136,6 @@ def parse_marker(marker: str):
     return out
 
 
-# EEGNet model builder
-# -------------------------------------------------------------
-
-def make_eegnet_clf(n_chans, n_times, n_classes, device, drop_prob):
-    model = EEGNet(
-        n_chans=n_chans,
-        n_outputs=n_classes,
-        n_times=n_times,
-        final_conv_length="auto",
-        drop_prob=drop_prob,
-    ).to(device)
-
-    clf = EEGClassifier(
-        model,
-        criterion=torch.nn.CrossEntropyLoss,
-        optimizer=torch.optim.Adam,
-        batch_size=1,
-        max_epochs=1,
-        device=device,
-        train_split=None,
-        classes=list(range(n_classes)),
-    )
-    return clf
-
-
 # Utilities
 # -------------------------------------------------------------
 
@@ -196,7 +154,7 @@ def make_decision_outlet():
         channel_count=1,
         nominal_srate=0,
         channel_format="string",
-        source_id="p300-online-decoder"
+        source_id="p300-online-svm-decoder"
     )
     return StreamOutlet(info)
 
@@ -231,12 +189,10 @@ def bandpass_filter_continuous_eeg(eeg, srate, lowcut=0.1, highcut=20.0, order=4
     return eeg_filt.astype(np.float32)
 
 
-def apply_channelwise_normalizer(X, mean, std):
-    """
-    X shape: (N, C, T)
-    mean/std shape: (1, C, 1)
-    """
-    return ((X - mean) / std).astype(np.float32)
+def downsample_epoch(epoch, factor):
+    if factor <= 1:
+        return epoch
+    return epoch[::factor, :]
 
 
 def symbol_from_row_col(row_idx, col_idx):
@@ -256,8 +212,6 @@ def main():
     parser.add_argument("--eeg_name", type=str, default="UnicornRecorderLSLStream")
     parser.add_argument("--marker_name", type=str, default="P300Markers")
     parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--norm_path", type=str, required=True,
-                        help="Path to saved channel-wise normalisation statistics (.npz)")
 
     parser.add_argument("--tmin", type=float, default=0.0)
     parser.add_argument("--tmax", type=float, default=0.8)
@@ -269,14 +223,12 @@ def main():
 
     parser.add_argument("--expected_srate", type=float, default=250.0)
     parser.add_argument("--n_chans", type=int, default=8)
-    parser.add_argument("--n_classes", type=int, default=2)
-    parser.add_argument("--drop_prob", type=float, default=0.44539302556010774)
+    parser.add_argument("--downsample_factor", type=int, default=4)
 
     parser.add_argument("--save_decisions", type=str, default=None,
                         help="Optional path to save online decoder outputs")
     args = parser.parse_args()
 
-    # Connect streams
     eeg_stream = find_stream("name", args.eeg_name, timeout=15)
     marker_stream = find_stream("name", args.marker_name, timeout=15)
 
@@ -298,38 +250,29 @@ def main():
     print(f"  name         : {marker_inlet.info().name()}")
     print(f"  type         : {marker_inlet.info().type()}")
 
-    # Build and load EEGNet
-    n_times = int(round((args.tmax - args.tmin) * args.expected_srate))
-    baseline_samples = int(round(args.baseline * args.expected_srate))
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Load model
+    print("\nLoading SVM model...")
+    model_package = joblib.load(args.model_path)
+    clf = model_package["pipeline"]
+    n_features_model = int(model_package["n_features"])
 
-    print("\nLoading model...")
-    print("device:", device)
-    print("n_chans:", args.n_chans)
-    print("n_times:", n_times)
+    n_times_runtime = int(round((args.tmax - args.tmin) * args.expected_srate))
+    n_times_after_downsample = len(np.arange(0, n_times_runtime, args.downsample_factor))
+    n_features_runtime = n_times_after_downsample * args.n_chans
 
-    clf = make_eegnet_clf(
-        n_chans=args.n_chans,
-        n_times=n_times,
-        n_classes=args.n_classes,
-        device=device,
-        drop_prob=args.drop_prob,
-    )
-
-    clf.initialize()
-    clf.load_params(f_params=args.model_path)
     print("Loaded model from:", args.model_path)
+    print("Model expects n_features:", n_features_model)
+    print("Runtime window n_times:", n_times_runtime)
+    print("Runtime n_times after downsampling:", n_times_after_downsample)
+    print("Runtime n_features:", n_features_runtime)
 
-    # Load saved channel-wise normalisation stats
-    norm_data = np.load(args.norm_path)
-    mean_ch = norm_data["mean_ch"].astype(np.float32)   # shape (1, C, 1)
-    std_ch = norm_data["std_ch"].astype(np.float32)     # shape (1, C, 1)
+    if n_features_runtime != n_features_model:
+        raise RuntimeError(
+            f"Runtime feature count ({n_features_runtime}) does not match "
+            f"model n_features ({n_features_model}). "
+            f"Adjust tmin/tmax/expected_srate/downsample_factor/n_chans."
+        )
 
-    print("Loaded normalisation stats from:", args.norm_path)
-    print("mean_ch shape:", mean_ch.shape)
-    print("std_ch shape :", std_ch.shape)
-
-    # Buffers
     eeg_samples = []
     eeg_timestamps = []
 
@@ -337,7 +280,6 @@ def main():
     row_scores = np.zeros(GRID_ROWS, dtype=np.float64)
     col_scores = np.zeros(GRID_COLS, dtype=np.float64)
 
-    # Decision logs for optional saving
     log_selection = []
     log_best_row = []
     log_best_col = []
@@ -346,7 +288,6 @@ def main():
     log_col_scores = []
     log_decision_time = []
 
-    # Per-flash logs
     log_flash_selection = []
     log_flash_seq = []
     log_flash_number = []
@@ -360,22 +301,20 @@ def main():
     print("\nDecoder is running...\n")
 
     experiment_ended = False
+    baseline_samples = int(round(args.baseline * args.expected_srate))
 
     try:
         while True:
-            # Pull EEG chunks continuously
             chunk, ts = eeg_inlet.pull_chunk(timeout=0.0, max_samples=128)
             if ts:
                 for sample in chunk:
                     eeg_samples.append(sample[:args.n_chans])
                 eeg_timestamps.extend(ts)
 
-            # Trim very old data to limit memory growth
             if len(eeg_timestamps) > 50000:
                 eeg_samples = eeg_samples[-30000:]
                 eeg_timestamps = eeg_timestamps[-30000:]
 
-            # Pull markers
             while True:
                 sample, mts = marker_inlet.pull_sample(timeout=0.0)
                 if mts is None:
@@ -385,7 +324,6 @@ def main():
                 parsed = parse_marker(marker)
                 print("[MARKER]", marker)
 
-                # Start of a new character selection
                 if parsed["event"] == "selection_start":
                     current_selection = parsed["selection"]
                     row_scores[:] = 0.0
@@ -393,7 +331,6 @@ def main():
                     print(f"\nStarted selection {current_selection}\n")
                     continue
 
-                # Each flash_on triggers online epoch extraction and scoring
                 if parsed["event"] == "flash_on":
                     if parsed["kind"] not in {"row", "col"}:
                         continue
@@ -409,7 +346,6 @@ def main():
 
                     i0, i1 = find_epoch_sample_range(eeg_ts_arr, t_start, t_end)
 
-                    # Wait until the full epoch is available in the buffer
                     wait_counter = 0
                     while i1 > len(eeg_samples) and wait_counter < 200:
                         chunk2, ts2 = eeg_inlet.pull_chunk(timeout=0.005, max_samples=128)
@@ -425,10 +361,9 @@ def main():
                         print("Skipping flash: incomplete epoch.")
                         continue
 
-                    # Filter continuous EEG first, matching CNN calibration preprocessing
                     eeg_arr = np.asarray(eeg_samples, dtype=np.float32)
 
-                    if eeg_arr.shape[0] < max(32, n_times):
+                    if eeg_arr.shape[0] < max(32, n_times_runtime):
                         print("Skipping flash: not enough buffered data for filtering.")
                         continue
 
@@ -446,11 +381,10 @@ def main():
 
                     epoch = eeg_filt[i0:i1, :]   # (T, C)
 
-                    # No resampling online
-                    if epoch.shape[0] != n_times:
+                    if epoch.shape[0] != n_times_runtime:
                         print(
                             f"Skipping flash: epoch length {epoch.shape[0]} "
-                            f"does not match expected {n_times}."
+                            f"does not match expected runtime length {n_times_runtime}."
                         )
                         continue
 
@@ -460,13 +394,17 @@ def main():
                             continue
                         epoch = baseline_correct(epoch, baseline_samples)
 
-                    # Convert (T, C) -> (1, C, T) for EEGNet
-                    X = np.transpose(epoch, (1, 0))[None, :, :].astype(np.float32)
+                    epoch = downsample_epoch(epoch, args.downsample_factor)
 
-                    # Apply saved training normalisation stats
-                    X = apply_channelwise_normalizer(X, mean_ch, std_ch)
+                    X = epoch.reshape(1, -1).astype(np.float32)
 
-                    # Probability that this flash is a target flash
+                    if X.shape[1] != n_features_model:
+                        print(
+                            f"Skipping flash: flattened feature count {X.shape[1]} "
+                            f"does not match model n_features {n_features_model}."
+                        )
+                        continue
+
                     proba = clf.predict_proba(X)[0]
                     target_prob = float(proba[1])
 

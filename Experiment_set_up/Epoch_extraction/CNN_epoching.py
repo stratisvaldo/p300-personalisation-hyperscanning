@@ -1,19 +1,40 @@
 # Load saved calibration recording
 # Find every flash_on marker
+# Filter continuous EEG from 0.1 to 20 Hz
 # Extract an EEG epoch around that marker
 # Label each epoch as target or non-target
+# Optionally reject artifacted epochs
 # Save a new .npz with X,y metadata
-
-# script saved X as (N_epochs, Timepoints, Channels)
+# script saves X as (N_epochs, Timepoints, Channels)
 
 '''
-From Experiment_set_up
-python Epoch_extraction/epoch_extraction_calibration.py --input Receiver_script/data/calib_play_01.npz --output Receiver_script/data/p300_epochs_play_01.npz --tmin 0.0 --tmax 0.8
+Pre-processing
+1. filter
+2. epoching
+3. reject bad or artifacted epochs (amplitude thresholding)
+4. baseline correction (subtract channel-wise mean of baseline window at epoch start)
+5. Standardise channels using training-set statistics (done in training code)
+CNN: standardize each channel (across time and epochs), since the network processes the temporal structure within each channel via convolution
+6. (N, T,C)
+'''
+
+'''
+Example:
+python Epoch_extraction/epoch_extraction_cnn.py `
+  --input Receiver_script/data/calib_play_01.npz `
+  --output Receiver_script/data/p300_epochs_play_01_cnn.npz `
+  --tmin 0.0 `
+  --tmax 0.8 `
+  --baseline 0.0 `
+  --lowcut 0.1 `
+  --highcut 20.0 `
+  --artifact_n_sd 4.0
 '''
 
 import os
 import argparse
 import numpy as np
+from scipy.signal import butter, filtfilt
 
 
 def load_recording(path):
@@ -48,21 +69,66 @@ def resample_epoch_if_needed(epoch, target_len):
     return out
 
 
+def bandpass_filter_continuous_eeg(eeg, srate, lowcut=0.1, highcut=20.0, order=4):
+    nyq = 0.5 * srate
+    if lowcut <= 0:
+        raise ValueError("lowcut must be > 0")
+    if highcut >= nyq:
+        raise ValueError(f"highcut must be below Nyquist ({nyq})")
+
+    b, a = butter(order, [lowcut / nyq, highcut / nyq], btype="bandpass")
+    eeg_filt = filtfilt(b, a, eeg, axis=0)
+    return eeg_filt.astype(np.float32)
+
+
+def compute_channelwise_sd_thresholds(eeg, n_sd=4.0):
+    """
+    eeg shape: (N_samples, N_channels)
+    Returns:
+        channel_thresholds: (N_channels,)
+        channel_stds: (N_channels,)
+    """
+    channel_stds = np.std(eeg, axis=0)
+    channel_thresholds = n_sd * channel_stds
+    return channel_thresholds.astype(np.float32), channel_stds.astype(np.float32)
+
+
+def reject_artifact(epoch, channel_thresholds):
+    """
+    epoch shape: (T, C)
+    channel_thresholds shape: (C,)
+    Reject if any channel exceeds its own threshold.
+    """
+    max_per_channel = np.max(np.abs(epoch), axis=0)
+    return np.any(max_per_channel > channel_thresholds)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=str, required=True)
-    parser.add_argument("--output", type=str, default="p300_epochs.npz")
+    parser.add_argument("--output", type=str, default="p300_epochs_cnn.npz")
     parser.add_argument("--tmin", type=float, default=0.0)
     parser.add_argument("--tmax", type=float, default=0.8)
     parser.add_argument("--baseline", type=float, default=0.0)
     parser.add_argument("--expected_srate", type=float, default=None)
     parser.add_argument("--drop_incomplete", action="store_true")
+
+    parser.add_argument("--lowcut", type=float, default=0.1)
+    parser.add_argument("--highcut", type=float, default=20.0)
+    parser.add_argument("--filter_order", type=int, default=4)
+
+    parser.add_argument(
+        "--artifact_n_sd",
+        type=float,
+        default=4.0,
+        help="Reject epoch if any channel exceeds N standard deviations of that channel"
+    )
+
     args = parser.parse_args()
 
     data = load_recording(args.input)
 
-    # Keep only the 8 EEG electrodes from the Unicorn stream
-    eeg_samples = data["eeg_samples"][:, :8]
+    eeg_samples = data["eeg_samples"][:, :8].astype(np.float32)
     eeg_timestamps = data["eeg_timestamps"]
     eeg_srate = float(data["eeg_srate"][0])
 
@@ -76,21 +142,35 @@ def main():
     event_seqs = data["event_seqs"]
     event_flashes = data["event_flashes"]
 
-    if args.expected_srate is not None:
-        srate = float(args.expected_srate)
-    else:
-        srate = eeg_srate
-
+    srate = float(args.expected_srate) if args.expected_srate is not None else eeg_srate
     epoch_len_sec = args.tmax - args.tmin
     expected_len = int(round(epoch_len_sec * srate))
     baseline_samples = int(round(args.baseline * srate))
 
-    print(f"Loaded EEG shape: {eeg_samples.shape}")
-    print(f"Loaded EEG srate: {eeg_srate}")
-    print(f"Using srate     : {srate}")
-    print(f"Epoch window    : {args.tmin:.3f} to {args.tmax:.3f} sec")
-    print(f"Expected length : {expected_len} samples")
-    print(f"Baseline        : {baseline_samples} samples")
+    print(f"Loaded EEG shape      : {eeg_samples.shape}")
+    print(f"Loaded EEG srate      : {eeg_srate}")
+    print(f"Using srate           : {srate}")
+    print(f"Epoch window          : {args.tmin:.3f} to {args.tmax:.3f} sec")
+    print(f"Expected epoch length : {expected_len} samples")
+    print(f"Baseline samples      : {baseline_samples}")
+    print(f"Bandpass              : {args.lowcut:.3f} to {args.highcut:.3f} Hz")
+    print(f"Artifact thresholding : {args.artifact_n_sd} SD per channel")
+
+    eeg_samples = bandpass_filter_continuous_eeg(
+        eeg_samples,
+        srate=eeg_srate,
+        lowcut=args.lowcut,
+        highcut=args.highcut,
+        order=args.filter_order,
+    )
+
+    channel_thresholds, channel_stds = compute_channelwise_sd_thresholds(
+        eeg_samples,
+        n_sd=args.artifact_n_sd
+    )
+
+    print(f"Channel STDs          : {channel_stds}")
+    print(f"Channel thresholds    : {channel_thresholds}")
 
     X = []
     y = []
@@ -106,13 +186,13 @@ def main():
     total_flash_on = 0
     kept_epochs = 0
     dropped_epochs = 0
+    rejected_artifacts = 0
 
     for i in range(len(event_names)):
         if str(event_names[i]) != "flash_on":
             continue
 
         total_flash_on += 1
-
         marker_time = float(marker_timestamps[i])
         label = int(event_is_target[i])
 
@@ -135,6 +215,10 @@ def main():
                 dropped_epochs += 1
                 continue
             epoch = resample_epoch_if_needed(epoch, expected_len)
+
+        if reject_artifact(epoch, channel_thresholds):
+            rejected_artifacts += 1
+            continue
 
         if baseline_samples > 0:
             if baseline_samples >= epoch.shape[0]:
@@ -161,14 +245,6 @@ def main():
     X = np.stack(X, axis=0)   # (N, T, C)
     y = np.asarray(y, dtype=np.int64)
 
-    meta_marker_raw = np.asarray(meta_marker_raw, dtype=object)
-    meta_marker_time = np.asarray(meta_marker_time, dtype=np.float64)
-    meta_kind = np.asarray(meta_kind, dtype=object)
-    meta_idx = np.asarray(meta_idx, dtype=np.int32)
-    meta_target_char = np.asarray(meta_target_char, dtype=object)
-    meta_seq = np.asarray(meta_seq, dtype=np.int32)
-    meta_flash = np.asarray(meta_flash, dtype=np.int32)
-
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
     np.savez(
@@ -179,28 +255,30 @@ def main():
         tmin=np.array([args.tmin], dtype=np.float32),
         tmax=np.array([args.tmax], dtype=np.float32),
         baseline=np.array([args.baseline], dtype=np.float32),
-        marker_raw=meta_marker_raw,
-        marker_time=meta_marker_time,
-        kind=meta_kind,
-        idx=meta_idx,
-        target_char=meta_target_char,
-        seq=meta_seq,
-        flash=meta_flash,
+        lowcut=np.array([args.lowcut], dtype=np.float32),
+        highcut=np.array([args.highcut], dtype=np.float32),
+        filter_order=np.array([args.filter_order], dtype=np.int32),
+        artifact_n_sd=np.array([args.artifact_n_sd], dtype=np.float32),
+        channel_stds=channel_stds,
+        channel_thresholds=channel_thresholds,
+        marker_raw=np.asarray(meta_marker_raw, dtype=object),
+        marker_time=np.asarray(meta_marker_time, dtype=np.float64),
+        kind=np.asarray(meta_kind, dtype=object),
+        idx=np.asarray(meta_idx, dtype=np.int32),
+        target_char=np.asarray(meta_target_char, dtype=object),
+        seq=np.asarray(meta_seq, dtype=np.int32),
+        flash=np.asarray(meta_flash, dtype=np.int32),
     )
 
-    print("\nSaved epoch dataset to:", args.output)
+    print("\nSaved CNN epoch dataset to:", args.output)
     print("X shape:", X.shape)
     print("y shape:", y.shape)
     print(f"Total flash_on markers: {total_flash_on}")
     print(f"Kept epochs          : {kept_epochs}")
     print(f"Dropped epochs       : {dropped_epochs}")
-
-    n_target = int((y == 1).sum())
-    n_nontarget = int((y == 0).sum())
-
-    print("\nClass counts:")
-    print(f"  target     : {n_target}")
-    print(f"  non-target : {n_nontarget}")
+    print(f"Rejected artifacts   : {rejected_artifacts}")
+    print(f"Target count         : {(y == 1).sum()}")
+    print(f"Non-target count     : {(y == 0).sum()}")
 
 
 if __name__ == "__main__":
