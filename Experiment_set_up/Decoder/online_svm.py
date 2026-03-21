@@ -236,6 +236,15 @@ def main():
     marker_inlet = StreamInlet(marker_stream)
     decision_outlet = make_decision_outlet()
 
+    # Get time corrections for both inlets so that EEG and marker timestamps are on the same clock
+    # time correctin is a pylsl method that measures the offset between two clocks
+
+    print("\nComputing LSL time corrections (this takes a few seconds)...")
+    eeg_time_correction = eeg_inlet.time_correction(timeout=5.0)
+    marker_time_correction = marker_inlet.time_correction(timeout=5.0)
+    print(f"  EEG time correction   : {eeg_time_correction:.6f} s")
+    print(f"  Marker time correction: {marker_time_correction:.6f} s")
+
     eeg_info = eeg_inlet.info()
     eeg_srate_nominal = eeg_info.nominal_srate()
     eeg_nchan = eeg_info.channel_count()
@@ -307,9 +316,15 @@ def main():
         while True:
             chunk, ts = eeg_inlet.pull_chunk(timeout=0.0, max_samples=128)
             if ts:
-                for sample in chunk:
+                for sample, t in zip(chunk, ts):
                     eeg_samples.append(sample[:args.n_chans])
-                eeg_timestamps.extend(ts)
+                    # ----------------------------------------------------------------
+                    # CHANGE 2: Apply the EEG time correction when storing each
+                    # timestamp. This maps EEG timestamps onto the same clock as
+                    # the marker timestamps so that searchsorted finds the right
+                    # indices when we look for an epoch window.
+                    # ----------------------------------------------------------------
+                    eeg_timestamps.append(t + eeg_time_correction)
 
             if len(eeg_timestamps) > 50000:
                 eeg_samples = eeg_samples[-30000:]
@@ -337,8 +352,15 @@ def main():
                     if parsed["idx"] is None:
                         continue
 
-                    t_start = float(mts) + args.tmin
-                    t_end = float(mts) + args.tmax
+                    # ----------------------------------------------------------------
+                    # CHANGE 3: Apply the marker time correction to the marker
+                    # timestamp before computing t_start / t_end. This ensures the
+                    # epoch window is on the same clock as the (corrected) EEG
+                    # timestamps stored above.
+                    # ----------------------------------------------------------------
+                    corrected_mts = float(mts) + marker_time_correction
+                    t_start = corrected_mts + args.tmin
+                    t_end   = corrected_mts + args.tmax
 
                     eeg_ts_arr = np.asarray(eeg_timestamps, dtype=np.float64)
                     if len(eeg_ts_arr) == 0:
@@ -346,13 +368,29 @@ def main():
 
                     i0, i1 = find_epoch_sample_range(eeg_ts_arr, t_start, t_end)
 
+                    # ----------------------------------------------------------------
+                    # CHANGE 4: Print a diagnostic line so you can immediately see
+                    # whether t_end falls inside or outside the EEG buffer range.
+                    # Remove this print once everything is working.
+                    # ----------------------------------------------------------------
+                    print(
+                        f"  [DBG] t_start={t_start:.4f} t_end={t_end:.4f} "
+                        f"eeg_range=[{eeg_ts_arr[0]:.4f}, {eeg_ts_arr[-1]:.4f}] "
+                        f"i0={i0} i1={i1} buf={len(eeg_samples)}"
+                    )
+
+                    # ----------------------------------------------------------------
+                    # CHANGE 5: Increased the wait loop from 200 to 500 iterations
+                    # (2.5 s max) so that slow EEG chunk delivery does not cause
+                    # epochs to be skipped unnecessarily.
+                    # ----------------------------------------------------------------
                     wait_counter = 0
-                    while i1 > len(eeg_samples) and wait_counter < 200:
+                    while i1 > len(eeg_samples) and wait_counter < 500:
                         chunk2, ts2 = eeg_inlet.pull_chunk(timeout=0.005, max_samples=128)
                         if ts2:
-                            for sample2 in chunk2:
+                            for sample2, t2 in zip(chunk2, ts2):
                                 eeg_samples.append(sample2[:args.n_chans])
-                            eeg_timestamps.extend(ts2)
+                                eeg_timestamps.append(t2 + eeg_time_correction)  # CHANGE 2 (same correction)
                             eeg_ts_arr = np.asarray(eeg_timestamps, dtype=np.float64)
                             i0, i1 = find_epoch_sample_range(eeg_ts_arr, t_start, t_end)
                         wait_counter += 1
