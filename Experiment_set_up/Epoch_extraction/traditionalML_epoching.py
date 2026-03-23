@@ -21,9 +21,9 @@ Pre-processing
 7. Standardise each feature using training-set statistics (SVM does this)
 Traditional ML: standardize each feature (each channel-timepoint combination in the flattened vector) independently, since SVM/LDA treats each dimension separately
 
-python Epoch_extraction/epoch_extraction_traditional_ml.py `
-  --input Receiver_script/data/calib_play_01.npz `
-  --output Receiver_script/data/p300_epochs_play_01_tradml.npz `
+python Experiment_set_up/Epoch_extraction/traditionalML_epoching.py `
+  --input data_calib/calib_play_01.npz `
+  --output epoched_data/p300_epochs_play_01_tradml.npz `
   --tmin 0.0 `
   --tmax 0.8 `
   --baseline 0.0 `

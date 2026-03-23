@@ -5,8 +5,9 @@
 
 '''
 Example:
-python train_svm_p300.py `
-  --input Receiver_script/data/p300_epochs_play_01.npz `
+Example:
+python Experiment_set_up/Decoder/train_svm.py `
+  --input epoched_data/p300_epochs_play_01_tradml.npz `
   --output models_svm/svm_calibration.joblib `
   --kernel linear `
   --C 1.0

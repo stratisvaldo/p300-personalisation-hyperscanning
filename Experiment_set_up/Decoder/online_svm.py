@@ -22,9 +22,9 @@ Pipeline per flash:
 6. apply saved scaler + SVM through sklearn pipeline
 
 Running:
-python online_free_spell_decoder_svm.py `
+python Experiment_set_up/Decoder/online_svm.py `
   --eeg_name Unicorn `
-  --marker_name P300Markers `
+  --marker_name P300Markers_test `
   --model_path models_svm/svm_calibration.joblib `
   --tmin 0.0 `
   --tmax 0.8 `
@@ -34,7 +34,8 @@ python online_free_spell_decoder_svm.py `
   --filter_order 4 `
   --expected_srate 250 `
   --downsample_factor 4 `
-  --save_decisions data/testing_play_01_svm_decisions.npz
+  --debug `
+  --save_decisions data_test/testing_play_01_svm_decisions.npz
 '''
 
 import os
@@ -171,12 +172,6 @@ def baseline_correct(epoch, baseline_samples):
     return epoch - baseline
 
 
-def find_epoch_sample_range(eeg_timestamps, t_start, t_end):
-    i0 = np.searchsorted(eeg_timestamps, t_start, side="left")
-    i1 = np.searchsorted(eeg_timestamps, t_end, side="left")
-    return i0, i1
-
-
 def bandpass_filter_continuous_eeg(eeg, srate, lowcut=0.1, highcut=20.0, order=4):
     nyq = 0.5 * srate
     if lowcut <= 0:
@@ -209,7 +204,7 @@ def symbol_from_row_col(row_idx, col_idx):
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--eeg_name", type=str, default="UnicornRecorderLSLStream")
+    parser.add_argument("--eeg_name", type=str, default="Unicorn")
     parser.add_argument("--marker_name", type=str, default="P300Markers")
     parser.add_argument("--model_path", type=str, required=True)
 
@@ -227,6 +222,8 @@ def main():
 
     parser.add_argument("--save_decisions", type=str, default=None,
                         help="Optional path to save online decoder outputs")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print timing diagnostics while waiting for epochs")
     args = parser.parse_args()
 
     eeg_stream = find_stream("name", args.eeg_name, timeout=15)
@@ -235,9 +232,6 @@ def main():
     eeg_inlet = StreamInlet(eeg_stream, max_chunklen=64)
     marker_inlet = StreamInlet(marker_stream)
     decision_outlet = make_decision_outlet()
-
-    # Get time corrections for both inlets so that EEG and marker timestamps are on the same clock
-    # time correctin is a pylsl method that measures the offset between two clocks
 
     print("\nComputing LSL time corrections (this takes a few seconds)...")
     eeg_time_correction = eeg_inlet.time_correction(timeout=5.0)
@@ -259,9 +253,15 @@ def main():
     print(f"  name         : {marker_inlet.info().name()}")
     print(f"  type         : {marker_inlet.info().type()}")
 
-    # Load model
     print("\nLoading SVM model...")
     model_package = joblib.load(args.model_path)
+
+    if not isinstance(model_package, dict):
+        raise RuntimeError("Expected .joblib to contain a dict with keys like 'pipeline' and 'n_features'.")
+
+    if "pipeline" not in model_package or "n_features" not in model_package:
+        raise RuntimeError("Saved model package is missing 'pipeline' or 'n_features'.")
+
     clf = model_package["pipeline"]
     n_features_model = int(model_package["n_features"])
 
@@ -318,12 +318,6 @@ def main():
             if ts:
                 for sample, t in zip(chunk, ts):
                     eeg_samples.append(sample[:args.n_chans])
-                    # ----------------------------------------------------------------
-                    # CHANGE 2: Apply the EEG time correction when storing each
-                    # timestamp. This maps EEG timestamps onto the same clock as
-                    # the marker timestamps so that searchsorted finds the right
-                    # indices when we look for an epoch window.
-                    # ----------------------------------------------------------------
                     eeg_timestamps.append(t + eeg_time_correction)
 
             if len(eeg_timestamps) > 50000:
@@ -352,50 +346,51 @@ def main():
                     if parsed["idx"] is None:
                         continue
 
-                    # ----------------------------------------------------------------
-                    # CHANGE 3: Apply the marker time correction to the marker
-                    # timestamp before computing t_start / t_end. This ensures the
-                    # epoch window is on the same clock as the (corrected) EEG
-                    # timestamps stored above.
-                    # ----------------------------------------------------------------
                     corrected_mts = float(mts) + marker_time_correction
                     t_start = corrected_mts + args.tmin
-                    t_end   = corrected_mts + args.tmax
+                    t_end = corrected_mts + args.tmax
 
-                    eeg_ts_arr = np.asarray(eeg_timestamps, dtype=np.float64)
-                    if len(eeg_ts_arr) == 0:
+                    if len(eeg_timestamps) == 0:
                         continue
 
-                    i0, i1 = find_epoch_sample_range(eeg_ts_arr, t_start, t_end)
-
-                    # ----------------------------------------------------------------
-                    # CHANGE 4: Print a diagnostic line so you can immediately see
-                    # whether t_end falls inside or outside the EEG buffer range.
-                    # Remove this print once everything is working.
-                    # ----------------------------------------------------------------
-                    print(
-                        f"  [DBG] t_start={t_start:.4f} t_end={t_end:.4f} "
-                        f"eeg_range=[{eeg_ts_arr[0]:.4f}, {eeg_ts_arr[-1]:.4f}] "
-                        f"i0={i0} i1={i1} buf={len(eeg_samples)}"
-                    )
-
-                    # ----------------------------------------------------------------
-                    # CHANGE 5: Increased the wait loop from 200 to 500 iterations
-                    # (2.5 s max) so that slow EEG chunk delivery does not cause
-                    # epochs to be skipped unnecessarily.
-                    # ----------------------------------------------------------------
+                    # Wait until the EEG buffer really contains samples up to t_end
                     wait_counter = 0
-                    while i1 > len(eeg_samples) and wait_counter < 500:
+                    max_wait_loops = 1200  # around 6s with timeout=0.005
+
+                    while True:
+                        if len(eeg_timestamps) > 0 and eeg_timestamps[-1] >= t_end:
+                            break
+
                         chunk2, ts2 = eeg_inlet.pull_chunk(timeout=0.005, max_samples=128)
                         if ts2:
                             for sample2, t2 in zip(chunk2, ts2):
                                 eeg_samples.append(sample2[:args.n_chans])
-                                eeg_timestamps.append(t2 + eeg_time_correction)  # CHANGE 2 (same correction)
-                            eeg_ts_arr = np.asarray(eeg_timestamps, dtype=np.float64)
-                            i0, i1 = find_epoch_sample_range(eeg_ts_arr, t_start, t_end)
-                        wait_counter += 1
+                                eeg_timestamps.append(t2 + eeg_time_correction)
 
-                    if i0 >= len(eeg_samples) or i1 > len(eeg_samples) or i1 <= i0:
+                        wait_counter += 1
+                        if wait_counter >= max_wait_loops:
+                            break
+
+                    eeg_ts_arr = np.asarray(eeg_timestamps, dtype=np.float64)
+                    if len(eeg_ts_arr) == 0:
+                        print("Skipping flash: no EEG timestamps available.")
+                        continue
+
+                    i0 = np.searchsorted(eeg_ts_arr, t_start, side="left")
+                    i1 = i0 + n_times_runtime
+
+                    if args.debug:
+                        print(
+                            f"  [DBG] t_start={t_start:.4f} t_end={t_end:.4f} "
+                            f"eeg_range=[{eeg_ts_arr[0]:.4f}, {eeg_ts_arr[-1]:.4f}] "
+                            f"i0={i0} i1={i1} buf={len(eeg_samples)}"
+                        )
+
+                    if eeg_ts_arr[-1] < t_end:
+                        print("Skipping flash: EEG buffer never reached epoch end.")
+                        continue
+
+                    if i0 < 0 or i1 > len(eeg_samples) or i1 <= i0:
                         print("Skipping flash: incomplete epoch.")
                         continue
 
@@ -434,6 +429,7 @@ def main():
 
                     epoch = downsample_epoch(epoch, args.downsample_factor)
 
+                    # Match training extraction exactly: epoch is (T, C), flatten directly
                     X = epoch.reshape(1, -1).astype(np.float32)
 
                     if X.shape[1] != n_features_model:
@@ -463,7 +459,7 @@ def main():
                     log_flash_kind.append(parsed["kind"])
                     log_flash_idx.append(parsed["idx"])
                     log_flash_target_prob.append(target_prob)
-                    log_flash_time.append(float(mts))
+                    log_flash_time.append(corrected_mts)
                     log_flash_row_scores_after.append(row_scores.copy())
                     log_flash_col_scores_after.append(col_scores.copy())
 
@@ -496,7 +492,7 @@ def main():
                     log_symbol.append("?" if predicted_symbol is None else predicted_symbol)
                     log_row_scores.append(row_scores.copy())
                     log_col_scores.append(col_scores.copy())
-                    log_decision_time.append(float(mts))
+                    log_decision_time.append(float(mts) + marker_time_correction)
 
                     current_selection = None
                     row_scores[:] = 0.0
