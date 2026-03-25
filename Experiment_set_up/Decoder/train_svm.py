@@ -5,7 +5,6 @@
 
 '''
 Example:
-Example:
 python Experiment_set_up/Decoder/train_svm.py `
   --input epoched_data/p300_epochs_play_01_tradml.npz `
   --output models_svm/svm_calibration.joblib `
