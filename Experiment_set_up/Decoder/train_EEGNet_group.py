@@ -7,7 +7,8 @@ python train_EEGNet_group.py \
   --epochs_path epoched_data/group_epochs_cnn.npz \
   --model_out models_eegnet/eegnet_group.pkl \
   --norm_out models_eegnet/eegnet_group_norm.npz \
-  --meta_out models_eegnet/eegnet_group_meta.json
+  --meta_out models_eegnet/eegnet_group_meta.json \
+  --metrics_out models_eegnet/eegnet_group_metrics.json
 '''
 
 import os
@@ -24,7 +25,7 @@ from skorch.callbacks import EpochScoring, EarlyStopping
 from skorch.helper import predefined_split
 
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import balanced_accuracy_score, accuracy_score, classification_report
+from sklearn.metrics import balanced_accuracy_score, accuracy_score, classification_report, confusion_matrix
 from torch.utils.data import TensorDataset
 
 
@@ -75,6 +76,7 @@ def main():
     parser.add_argument("--model_out", type=str, required=True)
     parser.add_argument("--norm_out", type=str, required=True)
     parser.add_argument("--meta_out", type=str, required=True)
+    parser.add_argument("--metrics_out", type=str, required=True)
 
     parser.add_argument("--valid_size", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=2025)
@@ -162,15 +164,19 @@ def main():
     y_valid_pred = clf.predict(X_valid)
     valid_bacc = balanced_accuracy_score(y_valid, y_valid_pred)
     valid_acc = accuracy_score(y_valid, y_valid_pred)
+    valid_cm = confusion_matrix(y_valid, y_valid_pred)
+    valid_report_dict = classification_report(y_valid, y_valid_pred, digits=4, output_dict=True)
+    valid_report_text = classification_report(y_valid, y_valid_pred, digits=4)
 
     print("\nValidation balanced accuracy:", float(valid_bacc))
     print("Validation accuracy:", float(valid_acc))
     print("\nValidation classification report:")
-    print(classification_report(y_valid, y_valid_pred, digits=4))
+    print(valid_report_text)
 
     os.makedirs(os.path.dirname(args.model_out) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(args.norm_out) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(args.meta_out) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(args.metrics_out) or ".", exist_ok=True)
 
     clf.save_params(f_params=args.model_out)
     np.savez(args.norm_out, mean_ch=mean_ch, std_ch=std_ch)
@@ -194,9 +200,41 @@ def main():
     with open(args.meta_out, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
+    metrics = {
+        "epochs_path": args.epochs_path,
+        "model_out": args.model_out,
+        "norm_out": args.norm_out,
+        "meta_out": args.meta_out,
+        "seed": args.seed,
+        "valid_size": args.valid_size,
+        "device": device,
+        "lr": args.lr,
+        "batch_size": args.batch_size,
+        "weight_decay": args.weight_decay,
+        "drop_prob": args.drop_prob,
+        "n_samples_total": int(n_samples),
+        "n_train": int(len(X_train)),
+        "n_valid": int(len(X_valid)),
+        "n_chans": int(n_chans),
+        "n_times": int(n_times),
+        "n_classes": int(n_classes),
+        "class_counts_train": {str(int(c)): int((y_train == c).sum()) for c in np.unique(y_train)},
+        "class_counts_valid": {str(int(c)): int((y_valid == c).sum()) for c in np.unique(y_valid)},
+        "validation": {
+            "balanced_accuracy": float(valid_bacc),
+            "accuracy": float(valid_acc),
+            "confusion_matrix": valid_cm.tolist(),
+            "classification_report": valid_report_dict,
+        }
+    }
+
+    with open(args.metrics_out, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+
     print("\nSaved model to:", args.model_out)
     print("Saved normalization stats to:", args.norm_out)
     print("Saved metadata to:", args.meta_out)
+    print("Saved metrics to:", args.metrics_out)
 
 
 if __name__ == "__main__":
