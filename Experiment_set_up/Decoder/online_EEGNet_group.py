@@ -27,6 +27,7 @@ python online_EEGNet_group.py \
   --filter_order 4 \
   --expected_srate 250 \
   --n_chans_per_participant 8 \
+  --random_seed 42 \
   --save_decisions data_test/testing_group_eegnet_decisions.npz
 '''
 
@@ -227,7 +228,11 @@ def main():
 
     parser.add_argument("--save_decisions", type=str, default=None)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--random_seed", type=int, default=None,
+                        help="Optional seed for reproducible random participant order per flash")
     args = parser.parse_args()
+
+    rng = np.random.default_rng(args.random_seed)
 
     with open(args.meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
@@ -268,12 +273,16 @@ def main():
     eeg_buffers_timestamps = []
 
     print("\nConnecting EEG streams...")
+    participant_runtime_names = []
     for stream_name in args.eeg_names:
         eeg_stream = find_stream("name", stream_name, timeout=15)
         inlet = StreamInlet(eeg_stream, max_chunklen=64)
         eeg_inlets.append(inlet)
         eeg_buffers_samples.append([])
         eeg_buffers_timestamps.append([])
+        participant_runtime_names.append(stream_name)
+
+    participant_runtime_names = np.asarray(participant_runtime_names, dtype=object)
 
     marker_stream = find_stream("name", args.marker_name, timeout=15)
     marker_inlet = StreamInlet(marker_stream)
@@ -284,6 +293,7 @@ def main():
         tc = inlet.time_correction(timeout=5.0)
         eeg_time_corrections.append(tc)
         info = inlet.info()
+        participant_runtime_names[p] = info.name()
         print(f"Participant {p+1}:")
         print(f"  name            : {info.name()}")
         print(f"  nominal_srate   : {info.nominal_srate()}")
@@ -313,6 +323,7 @@ def main():
     print("Loaded normalisation stats from:", args.norm_path)
     print("mean_ch shape:", mean_ch.shape)
     print("std_ch shape :", std_ch.shape)
+    print("Random seed:", args.random_seed)
 
     baseline_samples = int(round(args.baseline * args.expected_srate))
 
@@ -337,6 +348,8 @@ def main():
     log_flash_time = []
     log_flash_row_scores_after = []
     log_flash_col_scores_after = []
+    log_flash_participant_order = []
+    log_flash_participant_names_order = []
 
     print("\nGrouped EEGNet decoder is running...\n")
 
@@ -406,7 +419,7 @@ def main():
                         if wait_counter >= max_wait_loops:
                             break
 
-                    grouped_epoch_parts = []
+                    epoch_per_participant = []
                     valid_group_epoch = True
 
                     for p in range(n_participants_runtime):
@@ -473,10 +486,13 @@ def main():
                                 break
                             epoch = baseline_correct(epoch, baseline_samples)
 
-                        grouped_epoch_parts.append(epoch.astype(np.float32))
+                        epoch_per_participant.append(epoch.astype(np.float32))
 
                     if not valid_group_epoch:
                         continue
+
+                    perm = rng.permutation(n_participants_runtime)
+                    grouped_epoch_parts = [epoch_per_participant[p] for p in perm]
 
                     # concatenate along channels: [(T,C), (T,C), ...] -> (T, P*C)
                     grouped_epoch = np.concatenate(grouped_epoch_parts, axis=1).astype(np.float32)
@@ -507,13 +523,15 @@ def main():
                     log_flash_kind.append(parsed["kind"])
                     log_flash_idx.append(parsed["idx"])
                     log_flash_target_prob.append(target_prob)
-                    log_flash_time.append(float(mts))
+                    log_flash_time.append(corrected_mts)
                     log_flash_row_scores_after.append(row_scores.copy())
                     log_flash_col_scores_after.append(col_scores.copy())
+                    log_flash_participant_order.append(perm.astype(np.int32))
+                    log_flash_participant_names_order.append(participant_runtime_names[perm])
 
                     print(
                         f"Flash scored | kind={parsed['kind']} idx={parsed['idx']} "
-                        f"target_prob={target_prob:.4f}"
+                        f"target_prob={target_prob:.4f} order={perm}"
                     )
                     continue
 
@@ -582,6 +600,9 @@ def main():
             flash_time=np.asarray(log_flash_time, dtype=np.float64),
             flash_row_scores_after=np.asarray(log_flash_row_scores_after, dtype=np.float32),
             flash_col_scores_after=np.asarray(log_flash_col_scores_after, dtype=np.float32),
+            flash_participant_order=np.asarray(log_flash_participant_order, dtype=np.int32),
+            flash_participant_names_order=np.asarray(log_flash_participant_names_order, dtype=object),
+            random_seed=np.array([-1 if args.random_seed is None else args.random_seed], dtype=np.int32),
         )
 
         print("\nSaved decoder decisions to:", args.save_decisions)

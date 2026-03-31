@@ -12,6 +12,9 @@
 # Concatenation : epoch is (T,C) per participant -> (T, P*C) for P participants and C channels each
 # [ P1_ch1  P1_ch2  ... P1_ch8  P2_ch1  P2_ch2 ... P2_ch8 ... P8_ch8 ]
 
+# each epoch randomises order of participants in the concatenation, so that model cannot learn fixed participant order
+# rnd seed 42 for reproducibility
+
 '''
 python group_epoching_CNN.py \
   --input data_calib/group_calibration_recording.npz \
@@ -22,7 +25,8 @@ python group_epoching_CNN.py \
   --lowcut 0.1 \
   --highcut 20.0 \
   --filter_order 4 \
-  --artifact_n_sd 4.0
+  --artifact_n_sd 4.0 \
+  --random_seed 42
 
 '''
 
@@ -109,8 +113,16 @@ def main():
         help="Reject grouped epoch if any participant/channel exceeds N SD"
     )
     parser.add_argument("--max_channels", type=int, default=8)
+    parser.add_argument(
+        "--random_seed",
+        type=int,
+        default=None,
+        help="Optional seed for reproducible random participant order per epoch"
+    )
 
     args = parser.parse_args()
+
+    rng = np.random.default_rng(args.random_seed)
 
     data = load_recording(args.input)
 
@@ -189,6 +201,7 @@ def main():
     print(f"Bandpass                 : {args.lowcut} to {args.highcut} Hz")
     print(f"Artifact thresholding    : {args.artifact_n_sd} SD")
     print(f"Baseline samples         : {baseline_samples}")
+    print(f"Random seed              : {args.random_seed}")
 
     X = []
     y = []
@@ -200,6 +213,8 @@ def main():
     meta_target_char = []
     meta_seq = []
     meta_flash = []
+    meta_participant_order = []
+    meta_participant_names_order = []
 
     total_flash_on = 0
     kept_epochs = 0
@@ -218,7 +233,7 @@ def main():
             dropped_epochs += 1
             continue
 
-        grouped_epoch_parts = []
+        epoch_per_participant = []
         valid_group_epoch = True
         reject_group_epoch = False
 
@@ -253,7 +268,7 @@ def main():
                     break
                 epoch = baseline_correct(epoch, baseline_samples)
 
-            grouped_epoch_parts.append(epoch.astype(np.float32))
+            epoch_per_participant.append(epoch.astype(np.float32))
 
         if not valid_group_epoch:
             dropped_epochs += 1
@@ -262,6 +277,9 @@ def main():
         if reject_group_epoch:
             rejected_artifacts += 1
             continue
+
+        perm = rng.permutation(n_participants)
+        grouped_epoch_parts = [epoch_per_participant[p] for p in perm]
 
         # concatenate along channels: [(T,C), (T,C), ...] -> (T, P*C)
         grouped_epoch = np.concatenate(grouped_epoch_parts, axis=1).astype(np.float32)
@@ -276,6 +294,8 @@ def main():
         meta_target_char.append(str(event_target_chars[i]) if event_target_chars[i] is not None else "")
         meta_seq.append(int(event_seqs[i]))
         meta_flash.append(int(event_flashes[i]))
+        meta_participant_order.append(perm.astype(np.int32))
+        meta_participant_names_order.append(participant_names[perm])
 
         kept_epochs += 1
 
@@ -306,6 +326,7 @@ def main():
         highcut=np.array([args.highcut], dtype=np.float32),
         filter_order=np.array([args.filter_order], dtype=np.int32),
         artifact_n_sd=np.array([args.artifact_n_sd], dtype=np.float32),
+        random_seed=np.array([-1 if args.random_seed is None else args.random_seed], dtype=np.int32),
         marker_raw=np.asarray(meta_marker_raw, dtype=object),
         marker_time=np.asarray(meta_marker_time, dtype=np.float64),
         kind=np.asarray(meta_kind, dtype=object),
@@ -313,6 +334,8 @@ def main():
         target_char=np.asarray(meta_target_char, dtype=object),
         seq=np.asarray(meta_seq, dtype=np.int32),
         flash=np.asarray(meta_flash, dtype=np.int32),
+        participant_order_per_epoch=np.stack(meta_participant_order, axis=0),
+        participant_names_per_epoch=np.asarray(meta_participant_names_order, dtype=object),
     )
 
     print("\nSaved grouped CNN epoch dataset to:", args.output)

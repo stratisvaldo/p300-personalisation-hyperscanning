@@ -23,6 +23,9 @@ Pre-processing
 
 This creates one trial = all participants together in one flattened vector.
 
+- each epoch randomises order of participants in the concatenation, so that model cannot learn fixed participant order
+- rnd seed 42 for reproducibility
+
 Example:
 python Experiment_set_up/Epoch_extraction/group_epochML.py `
   --input data_calib/group_calibration_recording.npz `
@@ -33,7 +36,8 @@ python Experiment_set_up/Epoch_extraction/group_epochML.py `
   --lowcut 0.1 `
   --highcut 20.0 `
   --downsample_factor 4 `
-  --artifact_n_sd 4
+  --artifact_n_sd 4 `
+  --random_seed 42
 '''
 
 import os
@@ -131,8 +135,16 @@ def main():
     )
     parser.add_argument("--downsample_factor", type=int, default=4)
     parser.add_argument("--max_channels", type=int, default=8)
+    parser.add_argument(
+        "--random_seed",
+        type=int,
+        default=None,
+        help="Optional seed for reproducible random participant order per epoch"
+    )
 
     args = parser.parse_args()
+
+    rng = np.random.default_rng(args.random_seed)
 
     data = load_recording(args.input)
 
@@ -214,6 +226,7 @@ def main():
     print(f"Bandpass               : {args.lowcut:.3f} to {args.highcut:.3f} Hz")
     print(f"Artifact thresholding  : {args.artifact_n_sd} SD per channel")
     print(f"Downsample factor      : {args.downsample_factor}")
+    print(f"Random seed            : {args.random_seed}")
 
     X = []
     y = []
@@ -225,6 +238,8 @@ def main():
     meta_target_char = []
     meta_seq = []
     meta_flash = []
+    meta_participant_order = []
+    meta_participant_names_order = []
 
     total_flash_on = 0
     kept_epochs = 0
@@ -243,7 +258,7 @@ def main():
             dropped_epochs += 1
             continue
 
-        grouped_epoch_parts = []
+        epoch_per_participant = []
         valid_group_epoch = True
         reject_group_epoch = False
 
@@ -279,7 +294,7 @@ def main():
                 epoch = baseline_correct(epoch, baseline_samples)
 
             epoch = downsample_epoch(epoch, args.downsample_factor)
-            grouped_epoch_parts.append(epoch.reshape(-1).astype(np.float32))
+            epoch_per_participant.append(epoch.astype(np.float32))
 
         if not valid_group_epoch:
             dropped_epochs += 1
@@ -288,6 +303,12 @@ def main():
         if reject_group_epoch:
             rejected_artifacts += 1
             continue
+
+        perm = rng.permutation(n_participants)
+        grouped_epoch_parts = [
+            epoch_per_participant[p].reshape(-1).astype(np.float32)
+            for p in perm
+        ]
 
         features = np.concatenate(grouped_epoch_parts, axis=0).astype(np.float32)
 
@@ -301,6 +322,8 @@ def main():
         meta_target_char.append(str(event_target_chars[i]) if event_target_chars[i] is not None else "")
         meta_seq.append(int(event_seqs[i]))
         meta_flash.append(int(event_flashes[i]))
+        meta_participant_order.append(perm.astype(np.int32))
+        meta_participant_names_order.append(np.asarray(participant_names, dtype=object)[perm])
 
         kept_epochs += 1
 
@@ -335,6 +358,7 @@ def main():
         "filter_order": np.array([args.filter_order], dtype=np.int32),
         "artifact_n_sd": np.array([args.artifact_n_sd], dtype=np.float32),
         "downsample_factor": np.array([args.downsample_factor], dtype=np.int32),
+        "random_seed": np.array([-1 if args.random_seed is None else args.random_seed], dtype=np.int32),
 
         "n_features": np.array([n_features], dtype=np.int32),
         "features_per_participant": np.array([features_per_participant], dtype=np.int32),
@@ -346,6 +370,9 @@ def main():
         "target_char": np.asarray(meta_target_char, dtype=object),
         "seq": np.asarray(meta_seq, dtype=np.int32),
         "flash": np.asarray(meta_flash, dtype=np.int32),
+
+        "participant_order_per_epoch": np.stack(meta_participant_order, axis=0),
+        "participant_names_per_epoch": np.asarray(meta_participant_names_order, dtype=object),
     }
 
     for p in range(n_participants):

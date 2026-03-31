@@ -32,6 +32,7 @@ python Experiment_set_up/Decoder/online_svm_group.py `
   --n_chans 8 `
   --downsample_factor 4 `
   --debug `
+  --random_seed 42 `
   --save_decisions data_test/testing_play_group_svm_decisions.npz
 '''
 
@@ -210,7 +211,11 @@ def main():
                         help="Optional path to save online decoder outputs")
     parser.add_argument("--debug", action="store_true",
                         help="Print timing diagnostics while waiting for epochs")
+    parser.add_argument("--random_seed", type=int, default=None,
+                        help="Optional seed for reproducible random participant order per flash")
     args = parser.parse_args()
+
+    rng = np.random.default_rng(args.random_seed)
 
     n_participants_runtime = len(args.eeg_names)
 
@@ -232,15 +237,19 @@ def main():
     decision_outlet = make_decision_outlet()
 
     print("\nComputing LSL time corrections...")
+    participant_runtime_names = []
     for p, inlet in enumerate(eeg_inlets):
         tc = inlet.time_correction(timeout=5.0)
         eeg_time_corrections.append(tc)
         info = inlet.info()
+        participant_runtime_names.append(info.name())
         print(f"Participant {p+1}:")
         print(f"  name         : {info.name()}")
         print(f"  nominal_srate: {info.nominal_srate()}")
         print(f"  channel_count: {info.channel_count()}")
         print(f"  time_correction: {tc:.6f} s")
+
+    participant_runtime_names = np.asarray(participant_runtime_names, dtype=object)
 
     marker_time_correction = marker_inlet.time_correction(timeout=5.0)
     print(f"\nMarker time correction: {marker_time_correction:.6f} s")
@@ -276,6 +285,7 @@ def main():
     print("Runtime n_times after downsampling:", n_times_after_downsample)
     print("Features per participant:", features_per_participant)
     print("Runtime n_features:", n_features_runtime)
+    print("Random seed:", args.random_seed)
 
     if n_features_runtime != n_features_model:
         raise RuntimeError(
@@ -305,6 +315,8 @@ def main():
     log_flash_time = []
     log_flash_row_scores_after = []
     log_flash_col_scores_after = []
+    log_flash_participant_order = []
+    log_flash_participant_names_order = []
 
     baseline_samples = int(round(args.baseline * args.expected_srate))
 
@@ -375,7 +387,7 @@ def main():
                         if wait_counter >= max_wait_loops:
                             break
 
-                    grouped_parts = []
+                    epoch_per_participant = []
                     valid_group_epoch = True
 
                     for p in range(n_participants_runtime):
@@ -443,10 +455,16 @@ def main():
                             epoch = baseline_correct(epoch, baseline_samples)
 
                         epoch = downsample_epoch(epoch, args.downsample_factor)
-                        grouped_parts.append(epoch.reshape(-1).astype(np.float32))
+                        epoch_per_participant.append(epoch.astype(np.float32))
 
                     if not valid_group_epoch:
                         continue
+
+                    perm = rng.permutation(n_participants_runtime)
+                    grouped_parts = [
+                        epoch_per_participant[p].reshape(-1).astype(np.float32)
+                        for p in perm
+                    ]
 
                     X = np.concatenate(grouped_parts, axis=0).reshape(1, -1).astype(np.float32)
 
@@ -480,10 +498,12 @@ def main():
                     log_flash_time.append(corrected_mts)
                     log_flash_row_scores_after.append(row_scores.copy())
                     log_flash_col_scores_after.append(col_scores.copy())
+                    log_flash_participant_order.append(perm.astype(np.int32))
+                    log_flash_participant_names_order.append(participant_runtime_names[perm])
 
                     print(
                         f"Grouped flash scored | kind={parsed['kind']} idx={parsed['idx']} "
-                        f"target_prob={target_prob:.4f}"
+                        f"target_prob={target_prob:.4f} order={perm}"
                     )
                     continue
 
@@ -552,6 +572,9 @@ def main():
             flash_time=np.asarray(log_flash_time, dtype=np.float64),
             flash_row_scores_after=np.asarray(log_flash_row_scores_after, dtype=np.float32),
             flash_col_scores_after=np.asarray(log_flash_col_scores_after, dtype=np.float32),
+            flash_participant_order=np.asarray(log_flash_participant_order, dtype=np.int32),
+            flash_participant_names_order=np.asarray(log_flash_participant_names_order, dtype=object),
+            random_seed=np.array([-1 if args.random_seed is None else args.random_seed], dtype=np.int32),
         )
 
         print("\nSaved grouped decoder decisions to:", args.save_decisions)
