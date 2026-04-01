@@ -1,22 +1,4 @@
-'''
-- Connect to multiple Unicorn EEG streams
-- Connect to marker stream from free-speller
-- Load trained grouped SVM model
-- For every flash_on:
-    - collect one epoch from each participant stream
-    - preprocess each epoch exactly like training
-    - flatten each participant epoch
-    - concatenate into one grouped feature vector
-    - compute target probability
-- Accumulate evidence across sequences
-- Predict the row and column and convert to symbol
-- Send decision back through LSL
-- save online decisions for later analysis
-
-Online preprocessing matches grouped traditional ML training preprocessing except:
-- no artifact thresholding online
-- no epoch resampling online
-
+''''
 Example:
 python Experiment_set_up/Decoder/online_svm_group.py `
   --eeg_names Unicorn_P1 Unicorn_P2 Unicorn_P3 Unicorn_P4 Unicorn_P5 Unicorn_P6 Unicorn_P7 Unicorn_P8 `
@@ -32,8 +14,28 @@ python Experiment_set_up/Decoder/online_svm_group.py `
   --n_chans 8 `
   --downsample_factor 4 `
   --debug `
-  --random_seed 42 `
   --save_decisions data_test/testing_play_group_svm_decisions.npz
+'''
+
+'''
+- Connect to multiple Unicorn EEG streams
+- Connect to marker stream from free-speller
+- Load trained grouped SVM model and saved participant-wise scaling stats
+- For every flash_on:
+    - collect one epoch from each participant stream
+    - preprocess each participant exactly like training
+    - flatten each participant epoch
+    - concatenate into one grouped feature vector in fixed participant order
+    - compute target probability
+- Accumulate evidence across sequences
+- Predict the row and column and convert to symbol
+- Send decision back through LSL
+- save online decisions for later analysis
+
+Online preprocessing matches grouped traditional ML training preprocessing except:
+- no artifact thresholding online
+- no epoch resampling online
+- no permutation of participant order
 '''
 
 import os
@@ -179,6 +181,16 @@ def downsample_epoch(epoch, factor):
     return epoch[::factor, :]
 
 
+def apply_saved_standardisation(epoch, mean_vec, scale_vec):
+    mean_vec = np.asarray(mean_vec, dtype=np.float32).reshape(1, -1)
+    scale_vec = np.asarray(scale_vec, dtype=np.float32).reshape(1, -1)
+
+    safe_scale = scale_vec.copy()
+    safe_scale[safe_scale == 0] = 1.0
+
+    return (epoch - mean_vec) / safe_scale
+
+
 def symbol_from_row_col(row_idx, col_idx):
     if row_idx is None or col_idx is None:
         return None
@@ -211,11 +223,7 @@ def main():
                         help="Optional path to save online decoder outputs")
     parser.add_argument("--debug", action="store_true",
                         help="Print timing diagnostics while waiting for epochs")
-    parser.add_argument("--random_seed", type=int, default=None,
-                        help="Optional seed for reproducible random participant order per flash")
     args = parser.parse_args()
-
-    rng = np.random.default_rng(args.random_seed)
 
     n_participants_runtime = len(args.eeg_names)
 
@@ -258,20 +266,28 @@ def main():
     model_package = joblib.load(args.model_path)
 
     if not isinstance(model_package, dict):
-        raise RuntimeError("Expected .joblib to contain a dict with keys like 'pipeline' and 'n_features'.")
+        raise RuntimeError("Expected .joblib to contain a dict with keys like 'svm' and 'n_features'.")
 
-    if "pipeline" not in model_package or "n_features" not in model_package:
-        raise RuntimeError("Saved model package is missing 'pipeline' or 'n_features'.")
+    if "svm" not in model_package or "n_features" not in model_package:
+        raise RuntimeError("Saved model package is missing 'svm' or 'n_features'.")
 
-    clf = model_package["pipeline"]
+    clf = model_package["svm"]
     n_features_model = int(model_package["n_features"])
     n_participants_model = model_package.get("n_participants", None)
+    participant_scaler_means = model_package.get("participant_scaler_means", None)
+    participant_scaler_scales = model_package.get("participant_scaler_scales", None)
 
     if n_participants_model is not None and n_participants_model != n_participants_runtime:
         raise RuntimeError(
             f"Model was trained with {n_participants_model} participants but runtime provides "
             f"{n_participants_runtime} streams."
         )
+
+    if participant_scaler_means is None or participant_scaler_scales is None:
+        raise RuntimeError("Saved model package is missing participant-wise scaler statistics.")
+
+    if len(participant_scaler_means) != n_participants_runtime or len(participant_scaler_scales) != n_participants_runtime:
+        raise RuntimeError("Number of saved participant scalers does not match runtime number of participants.")
 
     n_times_runtime = int(round((args.tmax - args.tmin) * args.expected_srate))
     n_times_after_downsample = len(np.arange(0, n_times_runtime, args.downsample_factor))
@@ -285,7 +301,7 @@ def main():
     print("Runtime n_times after downsampling:", n_times_after_downsample)
     print("Features per participant:", features_per_participant)
     print("Runtime n_features:", n_features_runtime)
-    print("Random seed:", args.random_seed)
+    print("Participant order:", list(args.eeg_names))
 
     if n_features_runtime != n_features_model:
         raise RuntimeError(
@@ -315,8 +331,6 @@ def main():
     log_flash_time = []
     log_flash_row_scores_after = []
     log_flash_col_scores_after = []
-    log_flash_participant_order = []
-    log_flash_participant_names_order = []
 
     baseline_samples = int(round(args.baseline * args.expected_srate))
 
@@ -454,16 +468,21 @@ def main():
                                 break
                             epoch = baseline_correct(epoch, baseline_samples)
 
+                        epoch = apply_saved_standardisation(
+                            epoch,
+                            participant_scaler_means[p],
+                            participant_scaler_scales[p]
+                        )
+
                         epoch = downsample_epoch(epoch, args.downsample_factor)
                         epoch_per_participant.append(epoch.astype(np.float32))
 
                     if not valid_group_epoch:
                         continue
 
-                    perm = rng.permutation(n_participants_runtime)
                     grouped_parts = [
                         epoch_per_participant[p].reshape(-1).astype(np.float32)
-                        for p in perm
+                        for p in range(n_participants_runtime)
                     ]
 
                     X = np.concatenate(grouped_parts, axis=0).reshape(1, -1).astype(np.float32)
@@ -498,12 +517,10 @@ def main():
                     log_flash_time.append(corrected_mts)
                     log_flash_row_scores_after.append(row_scores.copy())
                     log_flash_col_scores_after.append(col_scores.copy())
-                    log_flash_participant_order.append(perm.astype(np.int32))
-                    log_flash_participant_names_order.append(participant_runtime_names[perm])
 
                     print(
                         f"Grouped flash scored | kind={parsed['kind']} idx={parsed['idx']} "
-                        f"target_prob={target_prob:.4f} order={perm}"
+                        f"target_prob={target_prob:.4f}"
                     )
                     continue
 
@@ -572,9 +589,7 @@ def main():
             flash_time=np.asarray(log_flash_time, dtype=np.float64),
             flash_row_scores_after=np.asarray(log_flash_row_scores_after, dtype=np.float32),
             flash_col_scores_after=np.asarray(log_flash_col_scores_after, dtype=np.float32),
-            flash_participant_order=np.asarray(log_flash_participant_order, dtype=np.int32),
-            flash_participant_names_order=np.asarray(log_flash_participant_names_order, dtype=object),
-            random_seed=np.array([-1 if args.random_seed is None else args.random_seed], dtype=np.int32),
+            participant_names_runtime=participant_runtime_names,
         )
 
         print("\nSaved grouped decoder decisions to:", args.save_decisions)

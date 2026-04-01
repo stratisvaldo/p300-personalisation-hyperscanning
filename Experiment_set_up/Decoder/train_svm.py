@@ -1,19 +1,19 @@
 # Train an SVM on extracted P300 calibration epochs
-# Input .npz is expected to already contain flattened features
+# Input .npz is expected to already contain flattened and participant-wise standardised features
 # X shape should be (N_epochs, Features)
 # y should be 0 for non-target and 1 for target
 
-# cross-val (5 stratified folds) -> balanced acc 
+# cross-val (5 stratified folds) -> balanced acc
 # confusion matrix, classification report on training data (printed)
- 
+
 '''
 Example:
 python Experiment_set_up/Decoder/train_svm.py `
-  --input epoched_data/p300_epochs_play_01_tradml.npz `
-  --output models_svm/svm_calibration.joblib `
+  --input epoched_data/p300_group_epochs_tradml_flat.npz `
+  --output models_svm/svm_group_calibration.joblib `
   --kernel linear `
   --C 1.0 `
-  --metrics_output models_svm/svm_calibration_metrics.json
+  --metrics_output models_svm/svm_group_calibration_metrics.json
 '''
 
 import os
@@ -22,8 +22,6 @@ import argparse
 import joblib
 import numpy as np
 
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.metrics import classification_report, confusion_matrix
@@ -70,6 +68,8 @@ def main():
     print("Class counts:")
     print("  target     :", n_target)
     print("  non-target :", n_nontarget)
+    print("Input is assumed to already be participant-wise standardised.")
+    print("No StandardScaler is applied in training.")
 
     svm = SVC(
         kernel=args.kernel,
@@ -79,11 +79,6 @@ def main():
         class_weight="balanced",
         random_state=42,
     )
-
-    clf = Pipeline([
-        ("scaler", StandardScaler()),
-        ("svm", svm),
-    ])
 
     metrics_dict = {
         "input_file": args.input,
@@ -98,15 +93,15 @@ def main():
             "target_1": n_target,
             "non_target_0": n_nontarget,
         },
+        "standardisation": "participant-wise standardisation was already applied during epoch extraction",
     }
 
-    # Quick CV estimate on calibration data
     max_possible_folds = min(n_target, n_nontarget)
 
     if max_possible_folds >= 2:
         cv_folds = min(args.cv_folds, max_possible_folds)
         cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-        scores = cross_val_score(clf, X, y, cv=cv, scoring="balanced_accuracy")
+        scores = cross_val_score(svm, X, y, cv=cv, scoring="balanced_accuracy")
 
         print(f"\nCross-validated balanced accuracy ({cv_folds}-fold):")
         print("Scores:", np.round(scores, 4))
@@ -128,11 +123,9 @@ def main():
             "reason": "Not enough samples in one of the classes for cross-validation."
         }
 
-    # Fit on all calibration data
-    clf.fit(X, y)
+    svm.fit(X, y)
 
-    # Training-set sanity check
-    y_pred = clf.predict(X)
+    y_pred = svm.predict(X)
     cm = confusion_matrix(y, y_pred)
     report_dict = classification_report(y, y_pred, digits=4, output_dict=True)
     report_text = classification_report(y, y_pred, digits=4)
@@ -149,10 +142,36 @@ def main():
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
+    n_participants = int(data["n_participants"][0]) if "n_participants" in data else None
+    participant_names = data["participant_names"] if "participant_names" in data else None
+    features_per_participant = int(data["features_per_participant"][0]) if "features_per_participant" in data else None
+
+    participant_scaler_means = []
+    participant_scaler_scales = []
+
+    if n_participants is not None:
+        for p in range(n_participants):
+            mean_key = f"scaler_mean_p{p+1}"
+            scale_key = f"scaler_scale_p{p+1}"
+
+            if mean_key not in data or scale_key not in data:
+                raise RuntimeError(
+                    f"Missing participant scaler stats in epoch file for participant {p+1}. "
+                    f"Expected keys {mean_key} and {scale_key}."
+                )
+
+            participant_scaler_means.append(data[mean_key].astype(np.float32))
+            participant_scaler_scales.append(data[scale_key].astype(np.float32))
+
     model_package = {
-        "pipeline": clf,
+        "svm": svm,
         "n_features": n_features,
         "classes": np.unique(y),
+        "n_participants": n_participants,
+        "participant_names": participant_names,
+        "features_per_participant": features_per_participant,
+        "participant_scaler_means": participant_scaler_means,
+        "participant_scaler_scales": participant_scaler_scales,
     }
 
     joblib.dump(model_package, args.output)
