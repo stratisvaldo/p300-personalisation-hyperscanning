@@ -1,10 +1,12 @@
 # Connect to multiple Unicorn EEG streams
 # Connect to marker stream from free-speller
 # Load trained grouped EEGNet model
-# Load saved channel-wise normalisation statistics
+# Load saved participant-wise normalisation statistics
 # For every flash_on:
 #   wait until all participant streams contain the full post-flash epoch
 #   preprocess each participant epoch exactly like training
+#   apply participant-wise normalisation
+#   optionally permute participants
 #   concatenate participants along channels
 #   score target probability with EEGNet
 # Accumulate evidence across sequences
@@ -193,8 +195,42 @@ def bandpass_filter_continuous_eeg(eeg, srate, lowcut=0.1, highcut=20.0, order=4
     return eeg_filt.astype(np.float32)
 
 
-def apply_channelwise_normalizer(X, mean, std):
-    return ((X - mean) / std).astype(np.float32)
+def apply_participantwise_normalizer(X_pp, mean_pp, std_pp):
+    """
+    X_pp   : (P, Cpp, T) or (N, P, Cpp, T)
+    mean_pp: (P, Cpp, 1)
+    std_pp : (P, Cpp, 1)
+    """
+    if X_pp.ndim == 3:
+        return ((X_pp - mean_pp) / std_pp).astype(np.float32)
+    if X_pp.ndim == 4:
+        return ((X_pp - mean_pp[None, :, :, :]) / std_pp[None, :, :, :]).astype(np.float32)
+    raise ValueError(f"Expected X_pp with ndim 3 or 4, got shape {X_pp.shape}")
+
+
+def permute_participant_blocks_single(X_pp, rng):
+    """
+    X_pp: (P, Cpp, T)
+    Returns:
+        X_perm: (P, Cpp, T)
+        perm  : (P,)
+    """
+    P = X_pp.shape[0]
+    perm = rng.permutation(P)
+    return X_pp[perm, :, :], perm
+
+
+def grouped_pp_to_eegnet_input(X_pp):
+    """
+    X_pp: (P, Cpp, T)
+    Returns:
+        X: (1, C_total, T)
+    """
+    P, Cpp, T = X_pp.shape
+    X = np.transpose(X_pp, (2, 0, 1))   # (T, P, Cpp)
+    X = X.reshape(T, P * Cpp)           # (T, C_total)
+    X = np.transpose(X, (1, 0))[None, :, :]  # (1, C_total, T)
+    return X.astype(np.float32)
 
 
 def symbol_from_row_col(row_idx, col_idx):
@@ -318,12 +354,24 @@ def main():
     print("Loaded model from:", args.model_path)
 
     norm_data = np.load(args.norm_path)
-    mean_ch = norm_data["mean_ch"].astype(np.float32)
-    std_ch = norm_data["std_ch"].astype(np.float32)
+    mean_pp = norm_data["mean_pp"].astype(np.float32)
+    std_pp = norm_data["std_pp"].astype(np.float32)
+
     print("Loaded normalisation stats from:", args.norm_path)
-    print("mean_ch shape:", mean_ch.shape)
-    print("std_ch shape :", std_ch.shape)
+    print("mean_pp shape:", mean_pp.shape)
+    print("std_pp shape :", std_pp.shape)
     print("Random seed:", args.random_seed)
+
+    if mean_pp.shape != (n_participants_model, n_chans_per_participant_model, 1):
+        raise RuntimeError(
+            f"mean_pp has shape {mean_pp.shape}, expected "
+            f"({n_participants_model}, {n_chans_per_participant_model}, 1)"
+        )
+    if std_pp.shape != (n_participants_model, n_chans_per_participant_model, 1):
+        raise RuntimeError(
+            f"std_pp has shape {std_pp.shape}, expected "
+            f"({n_participants_model}, {n_chans_per_participant_model}, 1)"
+        )
 
     baseline_samples = int(round(args.baseline * args.expected_srate))
 
@@ -491,14 +539,21 @@ def main():
                     if not valid_group_epoch:
                         continue
 
-                    perm = rng.permutation(n_participants_runtime)
-                    grouped_epoch_parts = [epoch_per_participant[p] for p in perm]
+                    # Stack participant epochs first
+                    # list of (T, C) -> (P, C, T)
+                    X_pp = np.stack(
+                        [ep.T for ep in epoch_per_participant],
+                        axis=0
+                    ).astype(np.float32)
 
-                    # concatenate along channels: [(T,C), (T,C), ...] -> (T, P*C)
-                    grouped_epoch = np.concatenate(grouped_epoch_parts, axis=1).astype(np.float32)
+                    # Apply participant-wise normalisation before permutation
+                    X_pp = apply_participantwise_normalizer(X_pp, mean_pp, std_pp)
 
-                    # (T, C_total) -> (1, C_total, T)
-                    X = np.transpose(grouped_epoch, (1, 0))[None, :, :].astype(np.float32)
+                    # Randomise participant order after normalisation
+                    X_pp, perm = permute_participant_blocks_single(X_pp, rng)
+
+                    # Convert to EEGNet input: (P, C, T) -> (1, C_total, T)
+                    X = grouped_pp_to_eegnet_input(X_pp)
 
                     if X.shape[1] != n_total_channels_model or X.shape[2] != n_times_model:
                         print(
@@ -506,8 +561,6 @@ def main():
                             f"model expectation (1, {n_total_channels_model}, {n_times_model})."
                         )
                         continue
-
-                    X = apply_channelwise_normalizer(X, mean_ch, std_ch)
 
                     proba = clf.predict_proba(X)[0]
                     target_prob = float(proba[1])

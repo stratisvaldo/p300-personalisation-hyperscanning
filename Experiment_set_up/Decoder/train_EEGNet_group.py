@@ -8,7 +8,8 @@ python train_EEGNet_group.py \
   --model_out models_eegnet/eegnet_group.pkl \
   --norm_out models_eegnet/eegnet_group_norm.npz \
   --meta_out models_eegnet/eegnet_group_meta.json \
-  --metrics_out models_eegnet/eegnet_group_metrics.json
+  --metrics_out models_eegnet/eegnet_group_metrics.json \
+  --permute_train
 '''
 
 import os
@@ -29,8 +30,104 @@ from sklearn.metrics import balanced_accuracy_score, accuracy_score, classificat
 from torch.utils.data import TensorDataset
 
 
-def apply_channelwise_normalizer(X, mean_ch, std_ch):
-    return ((X - mean_ch) / std_ch).astype(np.float32)
+def reshape_grouped_X_to_pp(X, n_participants, n_chans_per_participant):
+    """
+    Convert grouped EEG from:
+        (N, T, C_total)
+    to:
+        (N, P, Cpp, T)
+
+    where:
+        P   = n_participants
+        Cpp = n_chans_per_participant
+    """
+    if X.ndim != 3:
+        raise ValueError(f"Expected X with shape (N, T, C_total), got {X.shape}")
+
+    N, T, C_total = X.shape
+    expected = n_participants * n_chans_per_participant
+    if C_total != expected:
+        raise ValueError(
+            f"C_total={C_total} does not match "
+            f"n_participants * n_chans_per_participant = {expected}"
+        )
+
+    X_pp = X.reshape(N, T, n_participants, n_chans_per_participant)
+    X_pp = np.transpose(X_pp, (0, 2, 3, 1))  # (N, P, Cpp, T)
+    return X_pp.astype(np.float32)
+
+
+def reshape_pp_to_grouped_X(X_pp):
+    """
+    Convert participant-structured EEG from:
+        (N, P, Cpp, T)
+    back to:
+        (N, T, C_total)
+    """
+    if X_pp.ndim != 4:
+        raise ValueError(f"Expected X_pp with shape (N, P, Cpp, T), got {X_pp.shape}")
+
+    N, P, Cpp, T = X_pp.shape
+    X = np.transpose(X_pp, (0, 3, 1, 2))   # (N, T, P, Cpp)
+    X = X.reshape(N, T, P * Cpp)
+    return X.astype(np.float32)
+
+
+def fit_participantwise_zscore(X_pp):
+    """
+    Fit z-score stats separately for each participant and channel.
+
+    Input:
+        X_pp: (N, P, Cpp, T)
+
+    Returns:
+        mean_pp: (P, Cpp, 1)
+        std_pp : (P, Cpp, 1)
+    """
+    if X_pp.ndim != 4:
+        raise ValueError(f"Expected X_pp with shape (N, P, Cpp, T), got {X_pp.shape}")
+
+    mean_pp = X_pp.mean(axis=(0, 3), keepdims=False)[:, :, None].astype(np.float32)
+    std_pp = X_pp.std(axis=(0, 3), keepdims=False)[:, :, None].astype(np.float32)
+    std_pp[std_pp < 1e-8] = 1.0
+    return mean_pp, std_pp
+
+
+def apply_participantwise_zscore(X_pp, mean_pp, std_pp):
+    """
+    Apply participant-wise z-score.
+
+    X_pp   : (N, P, Cpp, T)
+    mean_pp: (P, Cpp, 1)
+    std_pp : (P, Cpp, 1)
+    """
+    if X_pp.ndim != 4:
+        raise ValueError(f"Expected X_pp with shape (N, P, Cpp, T), got {X_pp.shape}")
+
+    return ((X_pp - mean_pp[None, :, :, :]) / std_pp[None, :, :, :]).astype(np.float32)
+
+
+def permute_participant_blocks(X_pp, rng):
+    """
+    Independently permute participant order for each epoch.
+
+    Input:
+        X_pp: (N, P, Cpp, T)
+
+    Returns:
+        X_perm: (N, P, Cpp, T)
+        perms : (N, P)
+    """
+    N, P, Cpp, T = X_pp.shape
+    X_perm = np.empty_like(X_pp)
+    perms = np.empty((N, P), dtype=np.int64)
+
+    for i in range(N):
+        perm = rng.permutation(P)
+        perms[i] = perm
+        X_perm[i] = X_pp[i, perm, :, :]
+
+    return X_perm, perms
 
 
 def make_eegnet_clf(n_chans, n_times, n_classes, device, lr, batch_size, weight_decay, drop_prob, valid_ds):
@@ -86,9 +183,13 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1.3356750400520492e-05)
     parser.add_argument("--drop_prob", type=float, default=0.44539302556010774)
 
+    parser.add_argument("--permute_train", action="store_true")
+    parser.add_argument("--permute_valid", action="store_true")
+
     args = parser.parse_args()
 
     set_random_seeds(seed=args.seed, cuda=torch.cuda.is_available())
+    rng = np.random.default_rng(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     data = np.load(args.epochs_path, allow_pickle=True)
@@ -114,13 +215,6 @@ def main():
     print("Total channels:", n_total_channels)
     print("srate:", srate)
 
-    # (N, T, C) -> (N, C, T)
-    X = np.transpose(X, (0, 2, 1)).astype(np.float32)
-    print("Transposed X shape for EEGNet:", X.shape)
-
-    n_samples, n_chans, n_times = X.shape
-    n_classes = 2
-
     X_train, X_valid, y_train, y_valid = train_test_split(
         X,
         y,
@@ -129,23 +223,49 @@ def main():
         stratify=y,
     )
 
-    # channel-wise normalization from training split only
-    mean_ch = X_train.mean(axis=(0, 2), keepdims=True).astype(np.float32)   # (1, C, 1)
-    std_ch = X_train.std(axis=(0, 2), keepdims=True).astype(np.float32)
-    std_ch[std_ch < 1e-8] = 1.0
+    # Reshape from grouped channels into participant blocks
+    # X_*_pp shape: (N, P, Cpp, T)
+    X_train_pp = reshape_grouped_X_to_pp(X_train, n_participants, n_chans_per_participant)
+    X_valid_pp = reshape_grouped_X_to_pp(X_valid, n_participants, n_chans_per_participant)
 
-    X_train = apply_channelwise_normalizer(X_train, mean_ch, std_ch)
-    X_valid = apply_channelwise_normalizer(X_valid, mean_ch, std_ch)
+    # Fit participant-wise normalization on training split only
+    mean_pp, std_pp = fit_participantwise_zscore(X_train_pp)
+
+    # Apply participant-wise normalization before any permutation
+    X_train_pp = apply_participantwise_zscore(X_train_pp, mean_pp, std_pp)
+    X_valid_pp = apply_participantwise_zscore(X_valid_pp, mean_pp, std_pp)
+
+    train_perms = None
+    valid_perms = None
+
+    # Optional permutation after normalization
+    if args.permute_train:
+        X_train_pp, train_perms = permute_participant_blocks(X_train_pp, rng)
+
+    if args.permute_valid:
+        X_valid_pp, valid_perms = permute_participant_blocks(X_valid_pp, rng)
+
+    # Convert back to grouped channel format
+    # (N, P, Cpp, T) -> (N, T, C_total)
+    X_train = reshape_pp_to_grouped_X(X_train_pp)
+    X_valid = reshape_pp_to_grouped_X(X_valid_pp)
+
+    # EEGNet expects (N, C, T)
+    X_train = np.transpose(X_train, (0, 2, 1)).astype(np.float32)
+    X_valid = np.transpose(X_valid, (0, 2, 1)).astype(np.float32)
 
     print("Train shape:", X_train.shape)
     print("Valid shape:", X_valid.shape)
-    print("mean_ch shape:", mean_ch.shape)
-    print("std_ch shape:", std_ch.shape)
+    print("mean_pp shape:", mean_pp.shape)
+    print("std_pp shape:", std_pp.shape)
     print("Class counts train:", {int(c): int((y_train == c).sum()) for c in np.unique(y_train)})
     print("Class counts valid:", {int(c): int((y_valid == c).sum()) for c in np.unique(y_valid)})
 
     train_ds = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
     valid_ds = TensorDataset(torch.from_numpy(X_valid), torch.from_numpy(y_valid))
+
+    n_samples, n_chans, n_times = X_train.shape
+    n_classes = 2
 
     clf = make_eegnet_clf(
         n_chans=n_chans,
@@ -179,13 +299,21 @@ def main():
     os.makedirs(os.path.dirname(args.metrics_out) or ".", exist_ok=True)
 
     clf.save_params(f_params=args.model_out)
-    np.savez(args.norm_out, mean_ch=mean_ch, std_ch=std_ch)
+
+    # Save participant-wise normalization stats
+    np.savez(
+        args.norm_out,
+        mean_pp=mean_pp,
+        std_pp=std_pp,
+        n_participants=np.array([n_participants], dtype=np.int64),
+        n_chans_per_participant=np.array([n_chans_per_participant], dtype=np.int64),
+    )
 
     meta = {
         "n_participants": n_participants,
         "n_chans_per_participant": n_chans_per_participant,
         "n_total_channels": n_total_channels,
-        "n_times": n_times,
+        "n_times": int(n_times),
         "n_classes": n_classes,
         "srate": srate,
         "tmin": float(data["tmin"][0]) if "tmin" in data else None,
@@ -195,6 +323,9 @@ def main():
         "highcut": float(data["highcut"][0]) if "highcut" in data else None,
         "filter_order": int(data["filter_order"][0]) if "filter_order" in data else None,
         "drop_prob": args.drop_prob,
+        "normalization": "participantwise_before_permutation",
+        "permute_train": bool(args.permute_train),
+        "permute_valid": bool(args.permute_valid),
     }
 
     with open(args.meta_out, "w", encoding="utf-8") as f:
@@ -212,7 +343,7 @@ def main():
         "batch_size": args.batch_size,
         "weight_decay": args.weight_decay,
         "drop_prob": args.drop_prob,
-        "n_samples_total": int(n_samples),
+        "n_samples_total": int(len(X)),
         "n_train": int(len(X_train)),
         "n_valid": int(len(X_valid)),
         "n_chans": int(n_chans),
@@ -227,6 +358,11 @@ def main():
             "classification_report": valid_report_dict,
         }
     }
+
+    if train_perms is not None:
+        metrics["train_perm_example_first5"] = train_perms[:5].tolist()
+    if valid_perms is not None:
+        metrics["valid_perm_example_first5"] = valid_perms[:5].tolist()
 
     with open(args.metrics_out, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
