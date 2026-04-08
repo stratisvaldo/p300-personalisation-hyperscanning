@@ -14,7 +14,8 @@ python Experiment_set_up/Decoder/online_svm_group.py `
   --n_chans 8 `
   --downsample_factor 4 `
   --debug `
-  --save_decisions data_test/testing_play_group_svm_decisions.npz
+  --save_decisions data_test/testing_play_group_svm_decisions.npz `
+  --save_eeg_data data_test/testing_play_group_svm_eeg.npz
 '''
 
 '''
@@ -31,6 +32,7 @@ python Experiment_set_up/Decoder/online_svm_group.py `
 - Predict the row and column and convert to symbol
 - Send decision back through LSL
 - save online decisions for later analysis
+- save raw and filtered EEG for offline analysis
 
 Online preprocessing matches grouped traditional ML training preprocessing except:
 - no artifact thresholding online
@@ -221,6 +223,8 @@ def main():
 
     parser.add_argument("--save_decisions", type=str, default=None,
                         help="Optional path to save online decoder outputs")
+    parser.add_argument("--save_eeg_data", type=str, default=None,
+                        help="Optional path to save raw and filtered EEG for offline experiments")
     parser.add_argument("--debug", action="store_true",
                         help="Print timing diagnostics while waiting for epochs")
     args = parser.parse_args()
@@ -232,6 +236,10 @@ def main():
     eeg_buffers_samples = []
     eeg_buffers_timestamps = []
 
+    # full continuous logs for offline analysis
+    log_raw_samples_cont = []
+    log_raw_timestamps_cont = []
+
     print("\nConnecting EEG streams...")
     for stream_name in args.eeg_names:
         eeg_stream = find_stream("name", stream_name, timeout=15)
@@ -239,6 +247,8 @@ def main():
         eeg_inlets.append(inlet)
         eeg_buffers_samples.append([])
         eeg_buffers_timestamps.append([])
+        log_raw_samples_cont.append([])
+        log_raw_timestamps_cont.append([])
 
     marker_stream = find_stream("name", args.marker_name, timeout=15)
     marker_inlet = StreamInlet(marker_stream)
@@ -332,6 +342,10 @@ def main():
     log_flash_row_scores_after = []
     log_flash_col_scores_after = []
 
+    # per-flash EEG logs
+    log_flash_raw_epochs = []
+    log_flash_filtered_epochs = []
+
     baseline_samples = int(round(args.baseline * args.expected_srate))
 
     print("\nGrouped decoder is running...\n")
@@ -344,8 +358,14 @@ def main():
                 chunk, ts = inlet.pull_chunk(timeout=0.0, max_samples=128)
                 if ts:
                     for sample, t in zip(chunk, ts):
-                        eeg_buffers_samples[p].append(sample[:args.n_chans])
-                        eeg_buffers_timestamps[p].append(t + eeg_time_corrections[p])
+                        sample_used = np.asarray(sample[:args.n_chans], dtype=np.float32)
+                        t_corr = float(t) + eeg_time_corrections[p]
+
+                        eeg_buffers_samples[p].append(sample_used)
+                        eeg_buffers_timestamps[p].append(t_corr)
+
+                        log_raw_samples_cont[p].append(sample_used)
+                        log_raw_timestamps_cont[p].append(t_corr)
 
                 if len(eeg_buffers_timestamps[p]) > 50000:
                     eeg_buffers_samples[p] = eeg_buffers_samples[p][-30000:]
@@ -394,14 +414,22 @@ def main():
                             chunk2, ts2 = inlet.pull_chunk(timeout=0.005, max_samples=128)
                             if ts2:
                                 for sample2, t2 in zip(chunk2, ts2):
-                                    eeg_buffers_samples[p].append(sample2[:args.n_chans])
-                                    eeg_buffers_timestamps[p].append(t2 + eeg_time_corrections[p])
+                                    sample2_used = np.asarray(sample2[:args.n_chans], dtype=np.float32)
+                                    t2_corr = float(t2) + eeg_time_corrections[p]
+
+                                    eeg_buffers_samples[p].append(sample2_used)
+                                    eeg_buffers_timestamps[p].append(t2_corr)
+
+                                    log_raw_samples_cont[p].append(sample2_used)
+                                    log_raw_timestamps_cont[p].append(t2_corr)
 
                         wait_counter += 1
                         if wait_counter >= max_wait_loops:
                             break
 
                     epoch_per_participant = []
+                    raw_epoch_per_participant = []
+                    filt_epoch_per_participant = []
                     valid_group_epoch = True
 
                     for p in range(n_participants_runtime):
@@ -438,6 +466,8 @@ def main():
                             valid_group_epoch = False
                             break
 
+                        raw_epoch = eeg_arr[i0:i1, :].copy()
+
                         try:
                             eeg_filt = bandpass_filter_continuous_eeg(
                                 eeg_arr,
@@ -468,6 +498,9 @@ def main():
                                 break
                             epoch = baseline_correct(epoch, baseline_samples)
 
+                        raw_epoch_per_participant.append(raw_epoch.astype(np.float32))
+                        filt_epoch_per_participant.append(epoch.astype(np.float32))
+
                         epoch = apply_saved_standardisation(
                             epoch,
                             participant_scaler_means[p],
@@ -479,6 +512,10 @@ def main():
 
                     if not valid_group_epoch:
                         continue
+
+                    # save raw/filtered epochs for offline use as (P, T, C)
+                    log_flash_raw_epochs.append(np.stack(raw_epoch_per_participant, axis=0).astype(np.float32))
+                    log_flash_filtered_epochs.append(np.stack(filt_epoch_per_participant, axis=0).astype(np.float32))
 
                     grouped_parts = [
                         epoch_per_participant[p].reshape(-1).astype(np.float32)
@@ -593,6 +630,68 @@ def main():
         )
 
         print("\nSaved grouped decoder decisions to:", args.save_decisions)
+
+    if args.save_eeg_data is not None:
+        os.makedirs(os.path.dirname(args.save_eeg_data) or ".", exist_ok=True)
+
+        raw_samples_obj = np.empty(n_participants_runtime, dtype=object)
+        raw_timestamps_obj = np.empty(n_participants_runtime, dtype=object)
+        filtered_cont_samples_obj = np.empty(n_participants_runtime, dtype=object)
+        filtered_cont_timestamps_obj = np.empty(n_participants_runtime, dtype=object)
+
+        for p in range(n_participants_runtime):
+            raw_samples_p = np.asarray(log_raw_samples_cont[p], dtype=np.float32)
+            raw_ts_p = np.asarray(log_raw_timestamps_cont[p], dtype=np.float64)
+
+            raw_samples_obj[p] = raw_samples_p
+            raw_timestamps_obj[p] = raw_ts_p
+            filtered_cont_timestamps_obj[p] = raw_ts_p.copy()
+
+            if raw_samples_p.shape[0] >= max(32, int(args.expected_srate)):
+                try:
+                    filtered_cont_samples_obj[p] = bandpass_filter_continuous_eeg(
+                        raw_samples_p,
+                        srate=args.expected_srate,
+                        lowcut=args.lowcut,
+                        highcut=args.highcut,
+                        order=args.filter_order,
+                    ).astype(np.float32)
+                except Exception as e:
+                    print(f"Warning: failed to create continuous filtered EEG for participant {p+1}: {e}")
+                    filtered_cont_samples_obj[p] = np.empty((0, args.n_chans), dtype=np.float32)
+            else:
+                filtered_cont_samples_obj[p] = np.empty((0, args.n_chans), dtype=np.float32)
+
+        np.savez(
+            args.save_eeg_data,
+            participant_names_runtime=participant_runtime_names,
+            expected_srate=np.array([args.expected_srate], dtype=np.float32),
+            n_chans=np.array([args.n_chans], dtype=np.int32),
+            tmin=np.array([args.tmin], dtype=np.float32),
+            tmax=np.array([args.tmax], dtype=np.float32),
+            baseline=np.array([args.baseline], dtype=np.float32),
+            lowcut=np.array([args.lowcut], dtype=np.float32),
+            highcut=np.array([args.highcut], dtype=np.float32),
+            filter_order=np.array([args.filter_order], dtype=np.int32),
+            downsample_factor=np.array([args.downsample_factor], dtype=np.int32),
+
+            raw_samples=raw_samples_obj,
+            raw_timestamps=raw_timestamps_obj,
+            filtered_continuous_samples=filtered_cont_samples_obj,
+            filtered_continuous_timestamps=filtered_cont_timestamps_obj,
+
+            flash_selection=np.asarray(log_flash_selection, dtype=np.int32),
+            flash_seq=np.asarray(log_flash_seq, dtype=np.int32),
+            flash_number=np.asarray(log_flash_number, dtype=np.int32),
+            flash_kind=np.asarray(log_flash_kind, dtype=object),
+            flash_idx=np.asarray(log_flash_idx, dtype=np.int32),
+            flash_time=np.asarray(log_flash_time, dtype=np.float64),
+
+            flash_raw_epochs=np.asarray(log_flash_raw_epochs, dtype=np.float32),
+            flash_filtered_epochs=np.asarray(log_flash_filtered_epochs, dtype=np.float32),
+        )
+
+        print("\nSaved raw and filtered EEG data to:", args.save_eeg_data)
 
 
 if __name__ == "__main__":
