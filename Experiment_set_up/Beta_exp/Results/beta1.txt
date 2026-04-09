@@ -1,0 +1,58 @@
+- check SD does 1 participant at the time (maybe do both)
+2 SD
+- 7% for participant 1
+
+X shape      : (558, 800)
+y shape      : (558,)
+Total flash_on markers: 600
+Kept epochs          : 558
+Dropped epochs       : 0
+Rejected artifacts   : 42
+Target count         : 92
+Non-target count     : 466
+Effective srate      : 62.5
+Features per epoch   : 800
+Features per participant: 400
+
+Train SVM
+X shape: (558, 800)
+y shape: (558,)
+Features per epoch: 800
+Class counts:
+  target     : 92
+  non-target : 466
+Input is assumed to already be participant-wise standardised.
+No StandardScaler is applied in training.
+
+Cross-validated balanced accuracy (5-fold):
+Scores: [0.7565 0.826  0.8098 0.8181 0.7509]
+Mean  : 0.7922642054690604
+Std   : 0.03194835404613837
+
+Training-set confusion matrix:
+[[465   1]
+ [  0  92]]
+
+Training-set classification report:
+              precision    recall  f1-score   support
+
+           0     1.0000    0.9979    0.9989       466
+           1     0.9892    1.0000    0.9946        92
+
+    accuracy                         0.9982       558
+   macro avg     0.9946    0.9989    0.9968       558
+weighted avg     0.9982    0.9982    0.9982       558
+
+
+Online (has no SD rejection) + make time between letter longer to find next letter easier
+add that you have to put comma between unicorn names
+try 1
+word = SPAIN
+guessed = SNIVH
+try 2
+word = NORTH
+guessed = NORUH
+
+try 3 (with extra 3 seconds between letters - 6) 
+word = ITALY
+guessed = KT005 or KTOO5

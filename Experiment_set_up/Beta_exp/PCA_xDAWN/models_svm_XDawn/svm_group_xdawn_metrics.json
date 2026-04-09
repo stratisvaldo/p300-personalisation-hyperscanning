@@ -1,0 +1,77 @@
+{
+  "input_file": "Experiment_set_up/Beta_exp/Results/group_calibration_recording.npz",
+  "model_output": "Experiment_set_up/Beta_exp/PCA_xDAWN/models_svm_XDawn/svm_group_xdawn.joblib",
+  "model_type": "xDAWN + SVM",
+  "kernel": "linear",
+  "C": 1.0,
+  "gamma": "scale",
+  "xdawn_components": 2,
+  "requested_cv_folds": 5,
+  "grouped_input_shape": [
+    529,
+    2,
+    10,
+    50
+  ],
+  "n_samples": 529,
+  "class_counts": {
+    "target_1": 88,
+    "non_target_0": 441
+  },
+  "standardisation": "participant-wise standardisation was fit on each participant filtered continuous EEG",
+  "sfreq_after_downsample": 62.5,
+  "cross_validation": {
+    "used": true,
+    "scoring": "balanced_accuracy",
+    "cv_folds_used": 5,
+    "scores": [
+      0.5135492399206874,
+      0.6982323232323233,
+      0.7638888888888888,
+      0.7361111111111112,
+      0.7098930481283423
+    ],
+    "mean": 0.6843349222562706,
+    "std": 0.0883444533427294
+  },
+  "training_set": {
+    "confusion_matrix": [
+      [
+        334,
+        107
+      ],
+      [
+        10,
+        78
+      ]
+    ],
+    "classification_report": {
+      "0": {
+        "precision": 0.9709302325581395,
+        "recall": 0.7573696145124716,
+        "f1-score": 0.8509554140127389,
+        "support": 441.0
+      },
+      "1": {
+        "precision": 0.42162162162162165,
+        "recall": 0.8863636363636364,
+        "f1-score": 0.5714285714285714,
+        "support": 88.0
+      },
+      "accuracy": 0.77882797731569,
+      "macro avg": {
+        "precision": 0.6962759270898806,
+        "recall": 0.821866625438054,
+        "f1-score": 0.7111919927206551,
+        "support": 529.0
+      },
+      "weighted avg": {
+        "precision": 0.8795518624968661,
+        "recall": 0.77882797731569,
+        "f1-score": 0.8044556746036524,
+        "support": 529.0
+      }
+    },
+    "n_features_after_xdawn": 400
+  }
+}
