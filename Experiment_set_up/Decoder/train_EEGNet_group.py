@@ -9,6 +9,10 @@ python train_EEGNet_group.py \
   --norm_out models_eegnet/eegnet_group_norm.npz \
   --meta_out models_eegnet/eegnet_group_meta.json \
   --metrics_out models_eegnet/eegnet_group_metrics.json \
+  --lr 0.0007 \
+  --batch_size 128 \
+  --weight_decay 1e-5 \
+  --drop_prob 0.45 \
   --permute_train
 '''
 
