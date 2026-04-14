@@ -13,7 +13,8 @@ python train_EEGNet_group.py \
   --batch_size 128 \
   --weight_decay 1e-5 \
   --drop_prob 0.45 \
-  --permute_train
+  --permute_train \
+  --permute_valid
 '''
 
 import os
