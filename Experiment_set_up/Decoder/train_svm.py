@@ -27,6 +27,25 @@ from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.metrics import classification_report, confusion_matrix
 
 
+def shuffle_trials(X, y, rng):
+    """
+    Randomly shuffle the order of trials (epochs).
+
+    Input:
+        X  : (N, Features)
+        y  : (N,)
+        rng: numpy random generator
+
+    Returns:
+        X_shuf: (N, Features)
+        y_shuf: (N,)
+        idx   : (N,) shuffle indices — idx[i] is the original trial index
+                that ended up at position i after shuffling
+    """
+    idx = rng.permutation(len(X))
+    return X[idx], y[idx], idx
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=str, required=True,
@@ -39,9 +58,12 @@ def main():
     parser.add_argument("--gamma", type=str, default="scale",
                         help="Used for RBF kernel, e.g. 'scale' or 'auto'")
     parser.add_argument("--cv_folds", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--metrics_output", type=str, default=None,
                         help="Optional path to save training metrics as .json")
     args = parser.parse_args()
+
+    rng = np.random.default_rng(args.seed)
 
     data = np.load(args.input, allow_pickle=True)
 
@@ -71,13 +93,17 @@ def main():
     print("Input is assumed to already be participant-wise standardised.")
     print("No StandardScaler is applied in training.")
 
+    # Shuffle trial order before cross-validation and fitting
+    X, y, shuffle_idx = shuffle_trials(X, y, rng)
+    print("Trials shuffled with seed:", args.seed)
+
     svm = SVC(
         kernel=args.kernel,
         C=args.C,
         gamma=args.gamma,
         probability=True,
         class_weight="balanced",
-        random_state=42,
+        random_state=args.seed,
     )
 
     metrics_dict = {
@@ -86,6 +112,7 @@ def main():
         "kernel": args.kernel,
         "C": args.C,
         "gamma": args.gamma,
+        "seed": args.seed,
         "requested_cv_folds": int(args.cv_folds),
         "n_samples": int(len(X)),
         "n_features": n_features,
@@ -94,13 +121,15 @@ def main():
             "non_target_0": n_nontarget,
         },
         "standardisation": "participant-wise standardisation was already applied during epoch extraction",
+        "trial_shuffle": True,
+        "shuffle_idx": shuffle_idx.tolist(),
     }
 
     max_possible_folds = min(n_target, n_nontarget)
 
     if max_possible_folds >= 2:
         cv_folds = min(args.cv_folds, max_possible_folds)
-        cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+        cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=args.seed)
         scores = cross_val_score(svm, X, y, cv=cv, scoring="balanced_accuracy")
 
         print(f"\nCross-validated balanced accuracy ({cv_folds}-fold):")

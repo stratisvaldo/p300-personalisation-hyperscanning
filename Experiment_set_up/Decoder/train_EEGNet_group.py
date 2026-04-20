@@ -12,9 +12,7 @@ python train_EEGNet_group.py \
   --lr 0.0007 \
   --batch_size 128 \
   --weight_decay 1e-5 \
-  --drop_prob 0.45 \
-  --permute_train \
-  --permute_valid
+  --drop_prob 0.45
 '''
 
 import os
@@ -112,27 +110,23 @@ def apply_participantwise_zscore(X_pp, mean_pp, std_pp):
     return ((X_pp - mean_pp[None, :, :, :]) / std_pp[None, :, :, :]).astype(np.float32)
 
 
-def permute_participant_blocks(X_pp, rng):
+def shuffle_trials(X, y, rng):
     """
-    Independently permute participant order for each epoch.
+    Randomly shuffle the order of trials (epochs).
 
     Input:
-        X_pp: (N, P, Cpp, T)
+        X  : (N, C, T)
+        y  : (N,)
+        rng: numpy random generator
 
     Returns:
-        X_perm: (N, P, Cpp, T)
-        perms : (N, P)
+        X_shuf: (N, C, T)
+        y_shuf: (N,)
+        idx   : (N,) shuffle indices — idx[i] is the original trial index
+                that ended up at position i after shuffling
     """
-    N, P, Cpp, T = X_pp.shape
-    X_perm = np.empty_like(X_pp)
-    perms = np.empty((N, P), dtype=np.int64)
-
-    for i in range(N):
-        perm = rng.permutation(P)
-        perms[i] = perm
-        X_perm[i] = X_pp[i, perm, :, :]
-
-    return X_perm, perms
+    idx = rng.permutation(len(X))
+    return X[idx], y[idx], idx
 
 
 def make_eegnet_clf(n_chans, n_times, n_classes, device, lr, batch_size, weight_decay, drop_prob, valid_ds):
@@ -188,9 +182,6 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1.3356750400520492e-05)
     parser.add_argument("--drop_prob", type=float, default=0.44539302556010774)
 
-    parser.add_argument("--permute_train", action="store_true")
-    parser.add_argument("--permute_valid", action="store_true")
-
     args = parser.parse_args()
 
     set_random_seeds(seed=args.seed, cuda=torch.cuda.is_available())
@@ -236,19 +227,9 @@ def main():
     # Fit participant-wise normalization on training split only
     mean_pp, std_pp = fit_participantwise_zscore(X_train_pp)
 
-    # Apply participant-wise normalization before any permutation
+    # Apply participant-wise normalization
     X_train_pp = apply_participantwise_zscore(X_train_pp, mean_pp, std_pp)
     X_valid_pp = apply_participantwise_zscore(X_valid_pp, mean_pp, std_pp)
-
-    train_perms = None
-    valid_perms = None
-
-    # Optional permutation after normalization
-    if args.permute_train:
-        X_train_pp, train_perms = permute_participant_blocks(X_train_pp, rng)
-
-    if args.permute_valid:
-        X_valid_pp, valid_perms = permute_participant_blocks(X_valid_pp, rng)
 
     # Convert back to grouped channel format
     # (N, P, Cpp, T) -> (N, T, C_total)
@@ -258,6 +239,9 @@ def main():
     # EEGNet expects (N, C, T)
     X_train = np.transpose(X_train, (0, 2, 1)).astype(np.float32)
     X_valid = np.transpose(X_valid, (0, 2, 1)).astype(np.float32)
+
+    # Shuffle trial order in training set
+    X_train, y_train, train_shuffle_idx = shuffle_trials(X_train, y_train, rng)
 
     print("Train shape:", X_train.shape)
     print("Valid shape:", X_valid.shape)
@@ -328,9 +312,8 @@ def main():
         "highcut": float(data["highcut"][0]) if "highcut" in data else None,
         "filter_order": int(data["filter_order"][0]) if "filter_order" in data else None,
         "drop_prob": args.drop_prob,
-        "normalization": "participantwise_before_permutation",
-        "permute_train": bool(args.permute_train),
-        "permute_valid": bool(args.permute_valid),
+        "normalization": "participantwise",
+        "trial_shuffle": True,
     }
 
     with open(args.meta_out, "w", encoding="utf-8") as f:
@@ -356,6 +339,8 @@ def main():
         "n_classes": int(n_classes),
         "class_counts_train": {str(int(c)): int((y_train == c).sum()) for c in np.unique(y_train)},
         "class_counts_valid": {str(int(c)): int((y_valid == c).sum()) for c in np.unique(y_valid)},
+        "trial_shuffle": True,
+        "train_shuffle_idx": train_shuffle_idx.tolist(),
         "validation": {
             "balanced_accuracy": float(valid_bacc),
             "accuracy": float(valid_acc),
@@ -363,11 +348,6 @@ def main():
             "classification_report": valid_report_dict,
         }
     }
-
-    if train_perms is not None:
-        metrics["train_perm_example_first5"] = train_perms[:5].tolist()
-    if valid_perms is not None:
-        metrics["valid_perm_example_first5"] = valid_perms[:5].tolist()
 
     with open(args.metrics_out, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)

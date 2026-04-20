@@ -6,7 +6,6 @@
 #   wait until all participant streams contain the full post-flash epoch
 #   preprocess each participant epoch exactly like training
 #   apply participant-wise normalisation
-#   optionally permute participants
 #   concatenate participants along channels
 #   score target probability with EEGNet
 # Accumulate evidence across sequences
@@ -29,7 +28,6 @@ python online_EEGNet_group.py `
   --filter_order 4 `
   --expected_srate 250 `
   --n_chans_per_participant 8 `
-  --random_seed 42 `
   --save_decisions data_test/testing_group_eegnet_decisions.npz `
   --save_eeg_data data_test/testing_group_eegnet_eeg.npz
 '''
@@ -209,18 +207,6 @@ def apply_participantwise_normalizer(X_pp, mean_pp, std_pp):
     raise ValueError(f"Expected X_pp with ndim 3 or 4, got shape {X_pp.shape}")
 
 
-def permute_participant_blocks_single(X_pp, rng):
-    """
-    X_pp: (P, Cpp, T)
-    Returns:
-        X_perm: (P, Cpp, T)
-        perm  : (P,)
-    """
-    P = X_pp.shape[0]
-    perm = rng.permutation(P)
-    return X_pp[perm, :, :], perm
-
-
 def grouped_pp_to_eegnet_input(X_pp):
     """
     X_pp: (P, Cpp, T)
@@ -267,11 +253,7 @@ def main():
     parser.add_argument("--save_eeg_data", type=str, default=None,
                         help="Optional path to save raw and filtered EEG for offline experiments")
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--random_seed", type=int, default=None,
-                        help="Optional seed for reproducible random participant order per flash")
     args = parser.parse_args()
-
-    rng = np.random.default_rng(args.random_seed)
 
     with open(args.meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
@@ -369,7 +351,6 @@ def main():
     print("Loaded normalisation stats from:", args.norm_path)
     print("mean_pp shape:", mean_pp.shape)
     print("std_pp shape :", std_pp.shape)
-    print("Random seed:", args.random_seed)
 
     if mean_pp.shape != (n_participants_model, n_chans_per_participant_model, 1):
         raise RuntimeError(
@@ -405,8 +386,6 @@ def main():
     log_flash_time = []
     log_flash_row_scores_after = []
     log_flash_col_scores_after = []
-    log_flash_participant_order = []
-    log_flash_participant_names_order = []
 
     # per-flash EEG logs
     log_flash_raw_epochs = []
@@ -581,11 +560,8 @@ def main():
                         axis=0
                     ).astype(np.float32)
 
-                    # Apply participant-wise normalisation before permutation
+                    # Apply participant-wise normalisation
                     X_pp = apply_participantwise_normalizer(X_pp, mean_pp, std_pp)
-
-                    # Randomise participant order after normalisation
-                    X_pp, perm = permute_participant_blocks_single(X_pp, rng)
 
                     # Convert to EEGNet input: (P, C, T) -> (1, C_total, T)
                     X = grouped_pp_to_eegnet_input(X_pp)
@@ -614,12 +590,10 @@ def main():
                     log_flash_time.append(corrected_mts)
                     log_flash_row_scores_after.append(row_scores.copy())
                     log_flash_col_scores_after.append(col_scores.copy())
-                    log_flash_participant_order.append(perm.astype(np.int32))
-                    log_flash_participant_names_order.append(participant_runtime_names[perm])
 
                     print(
                         f"Flash scored | kind={parsed['kind']} idx={parsed['idx']} "
-                        f"target_prob={target_prob:.4f} order={perm}"
+                        f"target_prob={target_prob:.4f}"
                     )
                     continue
 
@@ -688,9 +662,6 @@ def main():
             flash_time=np.asarray(log_flash_time, dtype=np.float64),
             flash_row_scores_after=np.asarray(log_flash_row_scores_after, dtype=np.float32),
             flash_col_scores_after=np.asarray(log_flash_col_scores_after, dtype=np.float32),
-            flash_participant_order=np.asarray(log_flash_participant_order, dtype=np.int32),
-            flash_participant_names_order=np.asarray(log_flash_participant_names_order, dtype=object),
-            random_seed=np.array([-1 if args.random_seed is None else args.random_seed], dtype=np.int32),
         )
 
         print("\nSaved decoder decisions to:", args.save_decisions)
@@ -752,10 +723,6 @@ def main():
 
             flash_raw_epochs=np.asarray(log_flash_raw_epochs, dtype=np.float32),
             flash_filtered_epochs=np.asarray(log_flash_filtered_epochs, dtype=np.float32),
-
-            flash_participant_order=np.asarray(log_flash_participant_order, dtype=np.int32),
-            flash_participant_names_order=np.asarray(log_flash_participant_names_order, dtype=object),
-            random_seed=np.array([-1 if args.random_seed is None else args.random_seed], dtype=np.int32),
         )
 
         print("\nSaved raw and filtered EEG data to:", args.save_eeg_data)
